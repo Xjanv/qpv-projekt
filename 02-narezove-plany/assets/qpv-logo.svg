@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" viewBox="0 0 360 120">
+  <rect x="0" y="0" width="360" height="120" fill="#ffffff"/>
+  <rect x="8" y="8" width="344" height="104" rx="10" fill="#0f4c81"/>
+  <text x="28" y="74" font-family="Arial, sans-serif" font-size="56" font-weight="700" fill="#ffffff">QPV</text>
+  <text x="190" y="74" font-family="Arial, sans-serif" font-size="20" fill="#dbeafe">spol. s r.o.</text>
+</svg>
