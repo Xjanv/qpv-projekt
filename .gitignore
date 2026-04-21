@@ -9,6 +9,9 @@ venv/
 # Streamlit
 .streamlit/secrets.toml
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
