@@ -22,6 +22,7 @@ sys.modules["streamlit.components.v1"] = types.ModuleType("streamlit.components.
 from app_quality import (
     PartSpec, SheetFormat, Objectives, optimize,
     _gen_pattern, _generate_all_patterns, draw_sheet_figure,
+    _distinct_setups,
 )
 import random
 
@@ -93,15 +94,19 @@ def test_1_max2_five_types():
                    force_no_rotate=False, obj=obj, max_patterns=2)
 
     produced, undercov, overcov, total_sheets = _analyze(res, parts)
-    n_patterns = len(res.patterns_used)
+    # Count distinct machine setups: a trimmed "zbytek" sheet shares its parent's
+    # setup, so it must not count against max_patterns.
+    n_setups = _distinct_setups(res.patterns_used)
 
-    print(f"  Patterns: {n_patterns}, Sheets: {total_sheets}, Util: {res.utilization_ratio:.1%}")
+    print(f"  Setups: {n_setups}, Entries: {len(res.patterns_used)}, "
+          f"Sheets: {total_sheets}, Util: {res.utilization_ratio:.1%}")
     print(f"  Produced: {produced}")
     print(f"  Undercov: {undercov}")
     print(f"  Overcov:  {overcov}")
 
-    assert n_patterns <= 2, f"FAIL: {n_patterns} patterns > 2"
+    assert n_setups <= 2, f"FAIL: {n_setups} setups > 2"
     assert all(v == 0 for v in undercov.values()), f"FAIL: undercoverage {undercov}"
+    assert all(v == 0 for v in overcov.values()), f"FAIL: overproduction {overcov}"
     print("  PASS")
 
 
@@ -248,14 +253,17 @@ def test_7_max3_diverse():
                    force_no_rotate=False, obj=obj, max_patterns=3)
 
     produced, undercov, overcov, total_sheets = _analyze(res, parts)
-    n_patterns = len(res.patterns_used)
+    # Trimmed "zbytek" sheets share their parent's setup → count setups, not entries.
+    n_setups = _distinct_setups(res.patterns_used)
 
-    print(f"  Patterns: {n_patterns}, Sheets: {total_sheets}, Util: {res.utilization_ratio:.1%}")
+    print(f"  Setups: {n_setups}, Entries: {len(res.patterns_used)}, "
+          f"Sheets: {total_sheets}, Util: {res.utilization_ratio:.1%}")
     print(f"  Undercov: {undercov}")
     print(f"  Overcov:  {overcov}")
 
-    assert n_patterns <= 3, f"FAIL: {n_patterns} patterns > 3"
+    assert n_setups <= 3, f"FAIL: {n_setups} setups > 3"
     assert all(v == 0 for v in undercov.values()), f"FAIL: undercoverage {undercov}"
+    assert all(v == 0 for v in overcov.values()), f"FAIL: overproduction {overcov}"
     print("  PASS")
 
 

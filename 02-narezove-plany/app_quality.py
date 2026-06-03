@@ -124,6 +124,10 @@ class Pattern:
     placements: List[Placement]
     utilization: float
     total_items: int
+    # When set, this pattern is a trimmed ("partial") version of a full pattern
+    # (same machine setup, fewer pieces cut on the last sheet). It does NOT count
+    # as a separate cutting setup. Holds the parent full pattern's key().
+    parent_key: Optional[str] = None
 
     def key(self) -> str:
         counts_str = ",".join(f"{k}:{v}" for k, v in sorted(self.part_counts.items()))
@@ -244,29 +248,31 @@ def parse_formats(csv_text: str) -> List[SheetFormat]:
 
 _DEFAULT_PARTS_DF = pd.DataFrame({
     "Název": pd.Series(dtype="str"),
-    "Šířka (cm)": pd.Series(dtype="float"),
-    "Výška (cm)": pd.Series(dtype="float"),
+    "Šířka (mm)": pd.Series(dtype="float"),
+    "Výška (mm)": pd.Series(dtype="float"),
     "Počet kusů": pd.Series(dtype="int"),
     "Lze otočit": pd.Series(dtype="bool"),
 })
 
 _DEFAULT_FORMATS_DF = pd.DataFrame({
     "Název": pd.Series(dtype="str"),
-    "Šířka (cm)": pd.Series(dtype="float"),
-    "Výška (cm)": pd.Series(dtype="float"),
+    "Šířka (mm)": pd.Series(dtype="float"),
+    "Výška (mm)": pd.Series(dtype="float"),
     "Dostupné množství (0 = ∞)": pd.Series(dtype="int"),
 })
 
 
 def df_to_parts(df: "pd.DataFrame") -> List[PartSpec]:
-    rows = df.dropna(subset=["Název", "Šířka (cm)", "Výška (cm)", "Počet kusů"])
+    rows = df.dropna(subset=["Název", "Šířka (mm)", "Výška (mm)", "Počet kusů"])
     rows = rows[rows["Název"].astype(str).str.strip() != ""]
     if rows.empty:
         raise ValueError("Seznam dílců je prázdný. Zadej alespoň jeden dílec.")
     out: List[PartSpec] = []
     for i, (_, row) in enumerate(rows.iterrows(), start=1):
         name = str(row["Název"]).strip()
-        w, h, q = float(row["Šířka (cm)"]), float(row["Výška (cm)"]), int(row["Počet kusů"])
+        # UI stores millimetres; the algorithm works internally in centimetres.
+        w, h = float(row["Šířka (mm)"]) / 10.0, float(row["Výška (mm)"]) / 10.0
+        q = int(row["Počet kusů"])
         rotatable = bool(row.get("Lze otočit", False))
         if w <= 0 or h <= 0 or q <= 0:
             raise ValueError(f"Řádek {i} ({name}): šířka, výška i počet kusů musí být větší než 0.")
@@ -279,14 +285,15 @@ def df_to_parts(df: "pd.DataFrame") -> List[PartSpec]:
 
 
 def df_to_formats(df: "pd.DataFrame") -> List[SheetFormat]:
-    rows = df.dropna(subset=["Název", "Šířka (cm)", "Výška (cm)"])
+    rows = df.dropna(subset=["Název", "Šířka (mm)", "Výška (mm)"])
     rows = rows[rows["Název"].astype(str).str.strip() != ""]
     if rows.empty:
         raise ValueError("Zadej alespoň jeden formát archu.")
     out: List[SheetFormat] = []
     for i, (_, row) in enumerate(rows.iterrows(), start=1):
         name = str(row["Název"]).strip()
-        w, h = float(row["Šířka (cm)"]), float(row["Výška (cm)"])
+        # UI stores millimetres; the algorithm works internally in centimetres.
+        w, h = float(row["Šířka (mm)"]) / 10.0, float(row["Výška (mm)"]) / 10.0
         price = 0.0
         avail = int(row.get("Dostupné množství (0 = ∞)", 0) or 0)
         if w <= 0 or h <= 0:
@@ -652,9 +659,6 @@ def _select_patterns_mip(
     x = [solver.IntVar(0, M, f"x{i}") for i in range(n)]
     y = [solver.BoolVar(f"y{i}") for i in range(n)]
 
-    # Overproduction per part type (auxiliary)
-    overprod = [solver.NumVar(0, M, f"over_{j}") for j in range(len(part_names))]
-
     # Slack (undercoverage) per part type — soft demand constraint
     slack = [solver.IntVar(0, demand[pname], f"slack_{j}") for j, pname in enumerate(part_names)]
 
@@ -664,16 +668,18 @@ def _select_patterns_mip(
 
     # --- Constraints ---
 
-    # 1. Demand coverage (soft) + overproduction definition
+    # 1. Demand coverage (soft).
     # slack[j] captures undercoverage; penalized heavily in objective so solver
     # always prefers full coverage but stays feasible when max_patterns is very
     # restrictive (e.g. max_patterns=1 with many part types).
+    # Overproduction is intentionally NOT penalized: any surplus is trimmed off
+    # the last sheet afterwards (see _trim_overproduction), so the solver is free
+    # to repeat the fullest pattern and let the trim deliver the exact demand.
     for j, pname in enumerate(part_names):
         produced = solver.Sum(
             candidates[i].part_counts.get(pname, 0) * x[i] for i in range(n)
         )
         solver.Add(produced + slack[j] >= demand[pname])
-        solver.Add(overprod[j] >= produced - demand[pname])
 
     # 2. Pattern limit
     if max_patterns > 0:
@@ -717,7 +723,6 @@ def _select_patterns_mip(
         + n_obj.w_formats * solver.Sum(
             z[f] for f in fmt_names_set
         ) / max(n_fmts_available, 1)
-        + 10.0 * solver.Sum(overprod)
         + 1000.0 * solver.Sum(slack)
     )
 
@@ -849,6 +854,103 @@ def _build_result(
 
 
 # ---------------------------------------------------------------------------
+# Overproduction trimming
+# ---------------------------------------------------------------------------
+
+def _trim_overproduction(
+    selection: List[Tuple[Pattern, int]], demand: Dict[str, int],
+) -> List[Tuple[Pattern, int]]:
+    """Shave surplus pieces so the plan produces exactly the demanded counts.
+
+    Patterns repeat, so any surplus is removed from the LAST sheets. The trimmed
+    final sheet becomes its own pattern entry (same layout, fewer pieces, more
+    free space); sheets that become completely empty are dropped.
+    """
+    sheets: List[Pattern] = []
+    for pat, cnt in selection:
+        sheets.extend([pat] * cnt)
+
+    produced: Dict[str, int] = {}
+    for pat in sheets:
+        for k, v in pat.part_counts.items():
+            produced[k] = produced.get(k, 0) + v
+    surplus = {k: produced.get(k, 0) - demand.get(k, 0) for k in produced}
+    if all(s <= 0 for s in surplus.values()):
+        return selection
+
+    trimmed_rev: List[Pattern] = []
+    for pat in reversed(sheets):
+        if all(surplus.get(k, 0) <= 0 for k in pat.part_counts):
+            trimmed_rev.append(pat)
+            continue
+        keep: List[Placement] = []
+        for pl in reversed(pat.placements):
+            if surplus.get(pl.part_name, 0) > 0:
+                surplus[pl.part_name] -= 1  # drop this placement
+            else:
+                keep.append(pl)
+        keep.reverse()
+        if not keep:
+            continue  # whole sheet removed
+        if len(keep) == len(pat.placements):
+            trimmed_rev.append(pat)
+            continue
+        new_counts: Dict[str, int] = {}
+        for pl in keep:
+            new_counts[pl.part_name] = new_counts.get(pl.part_name, 0) + 1
+        # Back out the usable sheet area from the original utilization so the
+        # trimmed sheet reports a correct (lower) utilization.
+        orig_area = sum(pl.width_cm * pl.height_cm for pl in pat.placements)
+        usable = orig_area / pat.utilization if pat.utilization > 1e-9 else orig_area
+        new_area = sum(pl.width_cm * pl.height_cm for pl in keep)
+        trimmed_rev.append(Pattern(
+            fmt=pat.fmt, part_counts=new_counts, placements=keep,
+            utilization=(new_area / usable if usable > 1e-9 else 0.0),
+            total_items=len(keep),
+            parent_key=pat.key(),  # same machine setup as the full pattern
+        ))
+
+    sheets_final = list(reversed(trimmed_rev))
+
+    # Re-group identical sheets (by layout key) into (pattern, count), keeping order.
+    grouped: List[Tuple[Pattern, int]] = []
+    index_by_key: Dict[str, int] = {}
+    for pat in sheets_final:
+        k = pat.key()
+        if k in index_by_key:
+            gi = index_by_key[k]
+            grouped[gi] = (grouped[gi][0], grouped[gi][1] + 1)
+        else:
+            index_by_key[k] = len(grouped)
+            grouped.append((pat, 1))
+    return grouped
+
+
+def _setup_layout(selection: List[Tuple[Pattern, int]]) -> List[Tuple[int, bool]]:
+    """Map each selection entry to (setup number, is_partial).
+
+    A trimmed partial whose parent full pattern is also present shares the
+    parent's setup number and is flagged partial. Everything else gets its own
+    number. Setup numbers start at 1 and follow first-appearance order.
+    """
+    full_keys = {pat.key() for pat, _ in selection if pat.parent_key is None}
+    order: Dict[str, int] = {}
+    out: List[Tuple[int, bool]] = []
+    for pat, _ in selection:
+        attached = pat.parent_key is not None and pat.parent_key in full_keys
+        setup_key = pat.parent_key if attached else pat.key()
+        if setup_key not in order:
+            order[setup_key] = len(order) + 1
+        out.append((order[setup_key], attached))
+    return out
+
+
+def _distinct_setups(selection: List[Tuple[Pattern, int]]) -> int:
+    """Number of distinct machine setups (partials don't count separately)."""
+    return len({num for num, _ in _setup_layout(selection)})
+
+
+# ---------------------------------------------------------------------------
 # Main optimizer
 # ---------------------------------------------------------------------------
 
@@ -878,25 +980,34 @@ def _optimize_single_run(
         (f.width_cm - 2 * margin) * (f.height_cm - 2 * margin) for f in formats
     )
 
-    # --- Primary path: MIP solver for globally optimal pattern selection ---
-    selection = _select_patterns_mip(
-        all_patterns, demand, obj, fmt_limits, n_fmts, max_patterns,
-        margin, total_demand_area, ref_sheet_area,
-    )
-
-    # --- Fallback: if MIP fails, use best single repeated pattern ---
-    if not selection:
-        best_pat = max(all_patterns, key=lambda p: p.utilization)
-        # Use ceil(demand / count) to ensure full demand coverage (may overproduce slightly)
-        max_reps = max(
-            (math.ceil(demand[name] / cnt) for name, cnt in best_pat.part_counts.items()
-             if cnt > 0 and demand.get(name, 0) > 0),
-            default=1,
+    def _solve_pool(pool: List[Pattern]) -> List[Tuple[Pattern, int]]:
+        """MIP-select from a candidate pool, fall back to a repeated pattern,
+        then trim any overproduction down to the exact demand."""
+        if not pool:
+            return []
+        sel = _select_patterns_mip(
+            pool, demand, obj, fmt_limits, n_fmts, max_patterns,
+            margin, total_demand_area, ref_sheet_area,
         )
-        if max_reps > 0:
-            selection = [(best_pat, max(1, max_reps))]
-        else:
-            return None
+        if not sel:
+            best_pat = max(pool, key=lambda p: p.utilization)
+            max_reps = max(
+                (math.ceil(demand[name] / cnt) for name, cnt in best_pat.part_counts.items()
+                 if cnt > 0 and demand.get(name, 0) > 0),
+                default=1,
+            )
+            if max_reps <= 0:
+                return []
+            sel = [(best_pat, max(1, max_reps))]
+        return _trim_overproduction(sel, demand)
+
+    # --- Pattern selection. The candidate pool already contains the best
+    #     orientation for each layout (when rotation is allowed it includes
+    #     rotated variants, which pack tighter), so a single MIP pass picks the
+    #     fullest sheets. Overproduction is then trimmed to the exact demand. ---
+    selection = _solve_pool(all_patterns)
+    if not selection:
+        return None
 
     elapsed = time.perf_counter() - t0
     result = _build_result(selection, demand, formats, margin, 1, elapsed)
@@ -955,6 +1066,15 @@ def _dim_label(ax, x1: float, y1: float, x2: float, y2: float, text: str,
     )
 
 
+def _fmt_mm(v_cm: float) -> str:
+    """Format an internal cm value as millimetres for display.
+
+    Whole values drop the decimal (1000), half-millimetres keep it (193.5).
+    """
+    s = f"{v_cm * 10:.1f}"
+    return s[:-2] if s.endswith(".0") else s
+
+
 def draw_sheet_figure(
     placements: List[Placement], fmt: SheetFormat,
     pattern_count: int, label: str, margin: float,
@@ -964,7 +1084,7 @@ def draw_sheet_figure(
     fig.patch.set_facecolor("#fafbfc")
     ax.set_facecolor("#fafbfc")
 
-    title = f"{label}  -  {fmt.name} ({fw} x {fh} cm)"
+    title = f"{label}  -  {fmt.name} ({_fmt_mm(fw)} x {_fmt_mm(fh)} mm)"
     if pattern_count > 1:
         title += f"   [{pattern_count}x opakovat]"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=12, color="#334155")
@@ -980,12 +1100,12 @@ def draw_sheet_figure(
         ax.add_patch(Rectangle((margin, margin), uw, uh,
                                 fill=False, edgecolor="#cbd5e1", linewidth=0.7, linestyle="--"))
 
-    _dim_label(ax, 0, -3.0, fw, -3.0, f"{fw:.1f} cm", color="#64748b", fontsize=8)
+    _dim_label(ax, 0, -3.0, fw, -3.0, f"{_fmt_mm(fw)} mm", color="#64748b", fontsize=8)
     ax.plot([0, fw], [-2.0, -2.0], color="#94a3b8", linewidth=0.5)
     ax.plot([0, 0], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
     ax.plot([fw, fw], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
 
-    _dim_label(ax, -9.0, 0, -9.0, fh, f"{fh:.1f} cm", color="#64748b", fontsize=8)
+    _dim_label(ax, -9.0, 0, -9.0, fh, f"{_fmt_mm(fh)} mm", color="#64748b", fontsize=8)
     ax.plot([-8.0, -8.0], [0, fh], color="#94a3b8", linewidth=0.5)
     ax.plot([-9.2, -6.8], [0, 0], color="#94a3b8", linewidth=0.4)
     ax.plot([-9.2, -6.8], [fh, fh], color="#94a3b8", linewidth=0.4)
@@ -1006,7 +1126,7 @@ def draw_sheet_figure(
                     fontsize=fs, ha="center", va="center", color="#334155", fontweight="medium")
 
         if pl.width_cm >= 4 and pl.height_cm >= 2.5:
-            dim_text = f"{pl.width_cm:.1f} x {pl.height_cm:.1f}"
+            dim_text = f"{_fmt_mm(pl.width_cm)} x {_fmt_mm(pl.height_cm)}"
             fs2 = max(4.5, min(6.5, min_dim * 0.45))
             ax.text(x + pl.width_cm / 2, y + pl.height_cm * 0.65, dim_text,
                     fontsize=fs2, ha="center", va="center", color="#64748b")
@@ -1038,26 +1158,38 @@ def draw_sheet_figure(
         | {margin + pl.y_cm for pl in placements}
         | {margin + pl.y_cm + pl.height_cm for pl in placements}
     )
+    _TICK_FS = 5.0
+    # Two levels of tick labels get slightly different colours so the staggered
+    # rows are easy to tell apart (level 0 = dark, level 1 = lighter).
+    _LVL_COLORS = ["#1e3a5f", "#8aa0c4"]
     ax.set_xticks(x_edges)
-    ax.set_xticklabels([f"{v:.0f}" for v in x_edges], rotation=0, fontsize=7.5, ha="center")
+    ax.set_xticklabels([_fmt_mm(v) for v in x_edges], rotation=0, fontsize=_TICK_FS, ha="center")
     ax.set_yticks(y_edges)
-    ax.set_yticklabels([f"{v:.0f}" for v in y_edges], fontsize=7.5, ha="right")
-    # x labels only on the bottom (top would duplicate them and can't be staggered cleanly)
-    ax.tick_params(axis="x", labelsize=7.5, colors="#475569", length=5, width=0.8,
-                   top=True, bottom=True, labeltop=False, labelbottom=True)
-    ax.tick_params(axis="y", labelsize=7.5, colors="#475569", length=5, width=0.8, labelrotation=0)
+    ax.set_yticklabels([_fmt_mm(v) for v in y_edges], fontsize=_TICK_FS, ha="right")
+    ax.tick_params(axis="x", labelsize=_TICK_FS, colors="#475569", length=5, width=0.8,
+                   top=True, bottom=True, labeltop=True, labelbottom=True)
+    ax.tick_params(axis="y", labelsize=_TICK_FS, colors="#475569", length=5, width=0.8, labelrotation=0)
 
-    # Push every other "too close" label down (x) / left (y) so digits stay legible.
+    # Stagger every other "too close" label so digits stay legible, and colour
+    # each level differently. X: bottom (label1) goes down, top (label2) up.
+    # Y: left labels go further left.
     x_flags = _stagger_flags(x_edges, fw * 0.04)
     y_flags = _stagger_flags(y_edges, fh * 0.04)
-    off_down = mtransforms.ScaledTranslation(0, -11 / 72, fig.dpi_scale_trans)
-    off_left = mtransforms.ScaledTranslation(-15 / 72, 0, fig.dpi_scale_trans)
-    for lbl_t, flag in zip(ax.get_xticklabels(), x_flags):
+    off_down = mtransforms.ScaledTranslation(0, -8 / 72, fig.dpi_scale_trans)
+    off_up = mtransforms.ScaledTranslation(0, 8 / 72, fig.dpi_scale_trans)
+    off_left = mtransforms.ScaledTranslation(-11 / 72, 0, fig.dpi_scale_trans)
+    for tick, flag in zip(ax.xaxis.get_major_ticks(), x_flags):
+        col = _LVL_COLORS[flag]
+        tick.label1.set_color(col)
+        tick.label2.set_color(col)
         if flag:
-            lbl_t.set_transform(lbl_t.get_transform() + off_down)
-    for lbl_t, flag in zip(ax.get_yticklabels(), y_flags):
+            tick.label1.set_transform(tick.label1.get_transform() + off_down)
+            tick.label2.set_transform(tick.label2.get_transform() + off_up)
+    for tick, flag in zip(ax.yaxis.get_major_ticks(), y_flags):
+        col = _LVL_COLORS[flag]
+        tick.label1.set_color(col)
         if flag:
-            lbl_t.set_transform(lbl_t.get_transform() + off_left)
+            tick.label1.set_transform(tick.label1.get_transform() + off_left)
     # Grid lines at piece boundaries (more visible than default)
     ax.grid(axis="both", alpha=0.35, linewidth=0.6, color="#94a3b8", linestyle="--")
     for spine in ax.spines.values():
@@ -1114,11 +1246,13 @@ def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes]) -> 
     y_off -= 18
     pdf.setFillColor(colors.HexColor("#334155"))
     pdf.setFont(_PDF_FONT, 9)
-    for pat_idx, (pat, cnt) in enumerate(res.patterns_used):
+    pdf_setup = _setup_layout(res.patterns_used)
+    for (pat, cnt), (setup_num, is_partial) in zip(res.patterns_used, pdf_setup):
         parts_desc = ", ".join(f"{v}x {k}" for k, v in sorted(pat.part_counts.items()))
+        vzor_lbl = f"Vzor {setup_num}" + (" (zbytek)" if is_partial else "")
         pdf.drawString(28, y_off,
-                       f"Vzor {pat_idx + 1}: {cnt}x arch '{pat.fmt.name}' "
-                       f"({pat.fmt.width_cm} x {pat.fmt.height_cm} cm) - {parts_desc}")
+                       f"{vzor_lbl}: {cnt}x arch '{pat.fmt.name}' "
+                       f"({_fmt_mm(pat.fmt.width_cm)} x {_fmt_mm(pat.fmt.height_cm)} mm) - {parts_desc}")
         y_off -= 15
         if y_off < 40:
             pdf.showPage()
@@ -1127,8 +1261,8 @@ def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes]) -> 
     pdf.showPage()
 
     # One page per pattern
-    for pat_idx, (pat, cnt) in enumerate(res.patterns_used):
-        label = f"Vzor {pat_idx + 1}"
+    for (pat, cnt), (setup_num, is_partial) in zip(res.patterns_used, pdf_setup):
+        label = f"Vzor {setup_num}" + (" (zbytek)" if is_partial else "")
         head(f"{label} / {len(res.patterns_used)}  ({cnt}x)")
         fig = draw_sheet_figure(pat.placements, pat.fmt, cnt, label, margin)
         img = io.BytesIO()
@@ -1501,31 +1635,31 @@ def main() -> None:
     _TEST_SCENARIOS = {
         "simple": {
             "parts": [
-                {"Název": "DilecA", "Šířka (cm)": 50.0, "Výška (cm)": 30.0, "Počet kusů": 20, "Lze otočit": False},
-                {"Název": "DilecB", "Šířka (cm)": 40.0, "Výška (cm)": 25.0, "Počet kusů": 15, "Lze otočit": False},
+                {"Název": "DilecA", "Šířka (mm)": 500.0, "Výška (mm)": 300.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "DilecB", "Šířka (mm)": 400.0, "Výška (mm)": 250.0, "Počet kusů": 15, "Lze otočit": False},
             ],
             "formats": [
-                {"Název": "Standard", "Šířka (cm)": 200.0, "Výška (cm)": 150.0, "Dostupné množství (0 = ∞)": 0},
+                {"Název": "Standard", "Šířka (mm)": 2000.0, "Výška (mm)": 1500.0, "Dostupné množství (0 = ∞)": 0},
             ],
         },
         "complex5": {
             "parts": [
-                {"Název": "zada", "Šířka (cm)": 55.0, "Výška (cm)": 40.0, "Počet kusů": 20, "Lze otočit": False},
-                {"Název": "sedak", "Šířka (cm)": 50.0, "Výška (cm)": 50.0, "Počet kusů": 20, "Lze otočit": False},
-                {"Název": "operk", "Šířka (cm)": 60.0, "Výška (cm)": 52.0, "Počet kusů": 20, "Lze otočit": False},
-                {"Název": "boky", "Šířka (cm)": 70.0, "Výška (cm)": 30.0, "Počet kusů": 20, "Lze otočit": False},
-                {"Název": "pod_p", "Šířka (cm)": 26.0, "Výška (cm)": 12.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "zada", "Šířka (mm)": 550.0, "Výška (mm)": 400.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "sedak", "Šířka (mm)": 500.0, "Výška (mm)": 500.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "operk", "Šířka (mm)": 600.0, "Výška (mm)": 520.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "boky", "Šířka (mm)": 700.0, "Výška (mm)": 300.0, "Počet kusů": 20, "Lze otočit": False},
+                {"Název": "pod_p", "Šířka (mm)": 260.0, "Výška (mm)": 120.0, "Počet kusů": 20, "Lze otočit": False},
             ],
             "formats": [
-                {"Název": "Velky", "Šířka (cm)": 200.0, "Výška (cm)": 140.0, "Dostupné množství (0 = ∞)": 0},
+                {"Název": "Velky", "Šířka (mm)": 2000.0, "Výška (mm)": 1400.0, "Dostupné množství (0 = ∞)": 0},
             ],
         },
         "single100": {
             "parts": [
-                {"Název": "Panel", "Šířka (cm)": 80.0, "Výška (cm)": 60.0, "Počet kusů": 100, "Lze otočit": False},
+                {"Název": "Panel", "Šířka (mm)": 800.0, "Výška (mm)": 600.0, "Počet kusů": 100, "Lze otočit": False},
             ],
             "formats": [
-                {"Název": "Arch", "Šířka (cm)": 250.0, "Výška (cm)": 200.0, "Dostupné množství (0 = ∞)": 0},
+                {"Název": "Arch", "Šířka (mm)": 2500.0, "Výška (mm)": 2000.0, "Dostupné množství (0 = ∞)": 0},
             ],
         },
     }
@@ -1538,11 +1672,11 @@ def main() -> None:
         st.session_state["_test_loaded"] = _test_scenario
     if "parts_rows" not in st.session_state:
         st.session_state["parts_rows"] = pd.DataFrame(
-            [{"Název": "", "Šířka (cm)": None, "Výška (cm)": None, "Počet kusů": None, "Lze otočit": False}]
+            [{"Název": "", "Šířka (mm)": None, "Výška (mm)": None, "Počet kusů": None, "Lze otočit": False}]
         )
     if "formats_rows" not in st.session_state:
         st.session_state["formats_rows"] = pd.DataFrame(
-            [{"Název": "", "Šířka (cm)": None, "Výška (cm)": None, "Dostupné množství (0 = ∞)": None}]
+            [{"Název": "", "Šířka (mm)": None, "Výška (mm)": None, "Dostupné množství (0 = ∞)": None}]
         )
 
     # ======================== SIDEBAR ========================
@@ -1550,22 +1684,25 @@ def main() -> None:
         st.markdown("<div class='sidebar-section'>Nastavení řezu</div>", unsafe_allow_html=True)
         st.caption("Nastavte, kolik místa se na archu ztratí u okrajů a jak velká mezera bude mezi jednotlivými dílci. Program tyto hodnoty zohlední při výpočtu — výsledné rozložení pak bude přesně odpovídat tomu, co stroj skutečně zvládne.")
 
-        margin = st.number_input(
-            "Okraj archu (cm)", min_value=0.0, value=0.0, step=0.1,
+        margin_mm = st.number_input(
+            "Okraj archu (mm)", min_value=0.0, value=0.0, step=1.0, format="%g",
             help=(
                 "Část archu kolem dokola, kam stroj nesmí sáhnout. "
                 "Tato plocha se odečte ze všech čtyř stran před tím, než program začne dílce rozmísťovat.\n\n"
-                "Příklad: arch 100 × 140 cm s okrajem 1 cm → program pracuje jen s plochou 98 × 138 cm."
+                "Příklad: arch 1000 × 1400 mm s okrajem 10 mm → program pracuje jen s plochou 980 × 1380 mm."
             ),
         )
-        gap = st.number_input(
-            "Mezera mezi dílci (cm)", min_value=0.0, value=0.0, step=0.1,
+        gap_mm = st.number_input(
+            "Mezera mezi dílci (mm)", min_value=0.0, value=0.0, step=1.0, format="%g",
             help=(
                 "Prostor mezi sousedními dílci na archu — program ho rezervuje pro každý řez. "
                 "Větší mezera znamená více ztráty plochy.\n\n"
-                "Příklad: mezera 0,3 cm při 30 řezech = 9 cm plochy navíc spotřebovaných řezy."
+                "Příklad: mezera 3 mm při 30 řezech = 90 mm plochy navíc spotřebovaných řezy."
             ),
         )
+        # The algorithm works internally in centimetres.
+        margin = margin_mm / 10.0
+        gap = gap_mm / 10.0
 
         st.divider()
         st.markdown("<div class='sidebar-section'>Pravidla pro řezání</div>", unsafe_allow_html=True)
@@ -1580,7 +1717,7 @@ def main() -> None:
             help=(
                 "Určuje, zda program smí otočit dílec o 90°, aby se lépe vešel na arch. "
                 "Při povolení otáčení program najde lepší využití plochy.\n\n"
-                "Příklad: dílec 30 × 60 cm může být umístěn i jako 60 × 30 cm — "
+                "Příklad: dílec 300 × 600 mm může být umístěn i jako 600 × 300 mm — "
                 "záleží na tom, co se lépe hodí."
             ),
         )
@@ -1670,15 +1807,15 @@ def main() -> None:
 
     _PARTS_COLS = {
         "Název": st.column_config.TextColumn("Název", help="Název nebo označení dílce.", width="medium"),
-        "Šířka (cm)": st.column_config.NumberColumn("Šířka (cm)", min_value=0.1, step=0.1, help="Šířka dílce v cm.", width=90),
-        "Výška (cm)": st.column_config.NumberColumn("Výška (cm)", min_value=0.1, step=0.1, help="Výška dílce v cm.", width=90),
+        "Šířka (mm)": st.column_config.NumberColumn("Šířka (mm)", min_value=1.0, step=1.0, format="%g", help="Šířka dílce v mm.", width=90),
+        "Výška (mm)": st.column_config.NumberColumn("Výška (mm)", min_value=1.0, step=1.0, format="%g", help="Výška dílce v mm.", width=90),
         "Počet kusů": st.column_config.NumberColumn("Ks", min_value=1, step=1, help="Celkový počet kusů.", width=60),
         "Lze otočit": st.column_config.CheckboxColumn("Otočit ⓘ", help="Program smí otočit dílec o 90°, což může zlepšit využití plochy archu.", width=80),
     }
     _FMTS_COLS = {
         "Název": st.column_config.TextColumn("Název", help="Označení formátu archu.", width="small"),
-        "Šířka (cm)": st.column_config.NumberColumn("Šířka (cm)", min_value=0.1, step=0.1, help="Šířka archu v cm.", width=90),
-        "Výška (cm)": st.column_config.NumberColumn("Výška (cm)", min_value=0.1, step=0.1, help="Výška archu v cm.", width=90),
+        "Šířka (mm)": st.column_config.NumberColumn("Šířka (mm)", min_value=1.0, step=1.0, format="%g", help="Šířka archu v mm.", width=90),
+        "Výška (mm)": st.column_config.NumberColumn("Výška (mm)", min_value=1.0, step=1.0, format="%g", help="Výška archu v mm.", width=90),
         "Dostupné množství (0 = ∞)": st.column_config.NumberColumn("Počet (0 = ∞) ⓘ", min_value=0, step=1, help="Kolik archů tohoto formátu máte k dispozici. Hodnota 0 znamená neomezené množství.", width="small"),
     }
 
@@ -1710,10 +1847,10 @@ def main() -> None:
         _, _pc, _pd, _ = st.columns([2, 1, 1, 2])
         with _pc:
             if st.button("＋", key="add_part_row", help="Přidat nový dílec", use_container_width=True):
-                new_row = pd.DataFrame([{"Název": "", "Šířka (cm)": float("nan"), "Výška (cm)": float("nan"), "Počet kusů": float("nan"), "Lze otočit": False}])
+                new_row = pd.DataFrame([{"Název": "", "Šířka (mm)": float("nan"), "Výška (mm)": float("nan"), "Počet kusů": float("nan"), "Lze otočit": False}])
                 combined = pd.concat([parts_df, new_row], ignore_index=True)
-                combined["Šířka (cm)"] = pd.to_numeric(combined["Šířka (cm)"], errors="coerce")
-                combined["Výška (cm)"] = pd.to_numeric(combined["Výška (cm)"], errors="coerce")
+                combined["Šířka (mm)"] = pd.to_numeric(combined["Šířka (mm)"], errors="coerce")
+                combined["Výška (mm)"] = pd.to_numeric(combined["Výška (mm)"], errors="coerce")
                 combined["Počet kusů"] = pd.to_numeric(combined["Počet kusů"], errors="coerce")
                 st.session_state["parts_rows"] = combined
                 st.session_state["parts_editor_v"] += 1
@@ -1722,8 +1859,8 @@ def main() -> None:
             if st.button("－", key="del_part_row", help="Odebrat poslední řádek", use_container_width=True):
                 if len(parts_df) > 1:
                     trimmed = parts_df.iloc[:-1].reset_index(drop=True)
-                    trimmed["Šířka (cm)"] = pd.to_numeric(trimmed["Šířka (cm)"], errors="coerce")
-                    trimmed["Výška (cm)"] = pd.to_numeric(trimmed["Výška (cm)"], errors="coerce")
+                    trimmed["Šířka (mm)"] = pd.to_numeric(trimmed["Šířka (mm)"], errors="coerce")
+                    trimmed["Výška (mm)"] = pd.to_numeric(trimmed["Výška (mm)"], errors="coerce")
                     trimmed["Počet kusů"] = pd.to_numeric(trimmed["Počet kusů"], errors="coerce")
                     st.session_state["parts_rows"] = trimmed
                     st.session_state["parts_editor_v"] += 1
@@ -1754,10 +1891,10 @@ def main() -> None:
         _, _fc, _fd, _ = st.columns([2, 1, 1, 2])
         with _fc:
             if st.button("＋", key="add_fmt_row", help="Přidat nový formát archu", use_container_width=True):
-                new_row = pd.DataFrame([{"Název": "", "Šířka (cm)": float("nan"), "Výška (cm)": float("nan"), "Dostupné množství (0 = ∞)": float("nan")}])
+                new_row = pd.DataFrame([{"Název": "", "Šířka (mm)": float("nan"), "Výška (mm)": float("nan"), "Dostupné množství (0 = ∞)": float("nan")}])
                 combined = pd.concat([formats_df, new_row], ignore_index=True)
-                combined["Šířka (cm)"] = pd.to_numeric(combined["Šířka (cm)"], errors="coerce")
-                combined["Výška (cm)"] = pd.to_numeric(combined["Výška (cm)"], errors="coerce")
+                combined["Šířka (mm)"] = pd.to_numeric(combined["Šířka (mm)"], errors="coerce")
+                combined["Výška (mm)"] = pd.to_numeric(combined["Výška (mm)"], errors="coerce")
                 combined["Dostupné množství (0 = ∞)"] = pd.to_numeric(combined["Dostupné množství (0 = ∞)"], errors="coerce")
                 st.session_state["formats_rows"] = combined
                 st.session_state["formats_editor_v"] += 1
@@ -1766,8 +1903,8 @@ def main() -> None:
             if st.button("－", key="del_fmt_row", help="Odebrat poslední řádek", use_container_width=True):
                 if len(formats_df) > 1:
                     trimmed = formats_df.iloc[:-1].reset_index(drop=True)
-                    trimmed["Šířka (cm)"] = pd.to_numeric(trimmed["Šířka (cm)"], errors="coerce")
-                    trimmed["Výška (cm)"] = pd.to_numeric(trimmed["Výška (cm)"], errors="coerce")
+                    trimmed["Šířka (mm)"] = pd.to_numeric(trimmed["Šířka (mm)"], errors="coerce")
+                    trimmed["Výška (mm)"] = pd.to_numeric(trimmed["Výška (mm)"], errors="coerce")
                     trimmed["Dostupné množství (0 = ∞)"] = pd.to_numeric(trimmed["Dostupné množství (0 = ∞)"], errors="coerce")
                     st.session_state["formats_rows"] = trimmed
                     st.session_state["formats_editor_v"] += 1
@@ -1840,7 +1977,7 @@ def main() -> None:
                 break
         if not fits_any:
             st.warning(
-                f"Dílec **{html_mod.escape(p.name)}** ({p.width_cm} x {p.height_cm} cm) se nevejde "
+                f"Dílec **{html_mod.escape(p.name)}** ({_fmt_mm(p.width_cm)} x {_fmt_mm(p.height_cm)} mm) se nevejde "
                 f"na žádný dostupný arch! Optimalizace tento dílec přeskočí.",
                 icon="⚠️",
             )
@@ -1871,10 +2008,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    setup_layout = _setup_layout(res.patterns_used)
+    n_setups = _distinct_setups(res.patterns_used)
+    has_partial = any(is_p for _, is_p in setup_layout)
+
     if max_patterns > 0:
-        n_used = len(res.patterns_used)
         st.info(
-            f"Použito **{n_used}** z max. **{max_patterns}** variant nařezání.",
+            f"Použito **{n_setups}** z max. **{max_patterns}** variant nařezání.",
             icon="ℹ️",
         )
 
@@ -1897,7 +2037,7 @@ def main() -> None:
     # Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Celkem archů", f"{len(res.sheet_results)}")
-    m2.metric("Různých vzorů", f"{len(res.patterns_used)}")
+    m2.metric("Různých vzorů", f"{n_setups}")
     m3.metric("Výtěžnost", f"{res.utilization_ratio * 100.0:.1f} %")
     m4.metric("Doba výpočtu", f"{res.elapsed_sec:.1f} s")
 
@@ -1936,19 +2076,26 @@ def main() -> None:
 
     # --- Pattern summary ---
     st.markdown("##### Přehled rozložení")
+    setup_word = "vzoru" if n_setups == 1 else ("vzorů" if n_setups < 5 else "vzorů")
+    partial_note = (
+        "  Poslední arch je „zbytek“ — stejné nastavení jako jeho vzor, "
+        "jen se na něm nařeže méně kusů (aby nevznikly přebytky)."
+        if has_partial else ""
+    )
     st.caption(
         f"Celkem **{len(res.sheet_results)} archů** rozděleno do "
-        f"**{len(res.patterns_used)} různých vzorů**. "
-        f"Každý vzor se opakuje tolikrát, kolik je potřeba."
+        f"**{n_setups} {setup_word}**. "
+        f"Každý vzor se opakuje tolikrát, kolik je potřeba." + partial_note
     )
 
     summary_rows = []
-    for pat_idx, (pat, cnt) in enumerate(res.patterns_used):
+    for (pat, cnt), (setup_num, is_partial) in zip(res.patterns_used, setup_layout):
         parts_desc = ", ".join(f"{v}x {k}" for k, v in sorted(pat.part_counts.items()))
+        vzor_label = f"#{setup_num} (zbytek)" if is_partial else f"#{setup_num}"
         summary_rows.append({
-            "Vzor": f"#{pat_idx + 1}",
+            "Vzor": vzor_label,
             "Arch": pat.fmt.name,
-            "Rozměr": f"{pat.fmt.width_cm} x {pat.fmt.height_cm} cm",
+            "Rozměr": f"{_fmt_mm(pat.fmt.width_cm)} x {_fmt_mm(pat.fmt.height_cm)} mm",
             "Opakování": f"{cnt}x",
             "Dílců na arch": pat.total_items,
             "Výtěžnost": f"{pat.utilization * 100:.1f} %",
@@ -1958,11 +2105,11 @@ def main() -> None:
 
     # --- Pattern visualisations ---
     st.markdown("##### Nákresy vzorů")
-    for pat_idx, (pat, cnt) in enumerate(res.patterns_used):
-        label = f"Vzor #{pat_idx + 1}"
+    for (pat, cnt), (setup_num, is_partial) in zip(res.patterns_used, setup_layout):
+        label = f"Vzor #{setup_num}" + (" (zbytek)" if is_partial else "")
         parts_short = ", ".join(f"{v}x {k}" for k, v in sorted(pat.part_counts.items()))
         exp_title = (
-            f"{label}  —  {pat.fmt.name} ({pat.fmt.width_cm} x {pat.fmt.height_cm} cm)"
+            f"{label}  —  {pat.fmt.name} ({_fmt_mm(pat.fmt.width_cm)} x {_fmt_mm(pat.fmt.height_cm)} mm)"
             f"  —  {cnt}x opakovat  —  {parts_short}"
         )
         with st.expander(exp_title, expanded=(len(res.patterns_used) <= 5)):
