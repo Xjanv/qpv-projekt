@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
 from matplotlib.patches import Rectangle
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -1010,7 +1011,23 @@ def draw_sheet_figure(
             ax.text(x + pl.width_cm / 2, y + pl.height_cm * 0.65, dim_text,
                     fontsize=fs2, ha="center", va="center", color="#64748b")
 
-    # Custom ticks at piece boundaries
+    # Custom ticks at piece boundaries.
+    # When margin/gap put two cut lines close together (e.g. a piece end and the
+    # next piece start, separated only by the gap), their labels would overlap.
+    # We keep ALL labels but stagger neighbouring ones onto a second level.
+    def _stagger_flags(edges: List[float], min_gap: float) -> List[int]:
+        flags: List[int] = []
+        prev: Optional[float] = None
+        lvl = 0
+        for v in edges:
+            if prev is not None and (v - prev) < min_gap:
+                lvl ^= 1
+            else:
+                lvl = 0
+            flags.append(lvl)
+            prev = v
+        return flags
+
     x_edges = sorted(
         {0}
         | {margin + pl.x_cm for pl in placements}
@@ -1025,9 +1042,22 @@ def draw_sheet_figure(
     ax.set_xticklabels([f"{v:.0f}" for v in x_edges], rotation=0, fontsize=7.5, ha="center")
     ax.set_yticks(y_edges)
     ax.set_yticklabels([f"{v:.0f}" for v in y_edges], fontsize=7.5, ha="right")
+    # x labels only on the bottom (top would duplicate them and can't be staggered cleanly)
     ax.tick_params(axis="x", labelsize=7.5, colors="#475569", length=5, width=0.8,
-                   top=True, bottom=True, labeltop=True, labelbottom=True)
+                   top=True, bottom=True, labeltop=False, labelbottom=True)
     ax.tick_params(axis="y", labelsize=7.5, colors="#475569", length=5, width=0.8, labelrotation=0)
+
+    # Push every other "too close" label down (x) / left (y) so digits stay legible.
+    x_flags = _stagger_flags(x_edges, fw * 0.04)
+    y_flags = _stagger_flags(y_edges, fh * 0.04)
+    off_down = mtransforms.ScaledTranslation(0, -11 / 72, fig.dpi_scale_trans)
+    off_left = mtransforms.ScaledTranslation(-15 / 72, 0, fig.dpi_scale_trans)
+    for lbl_t, flag in zip(ax.get_xticklabels(), x_flags):
+        if flag:
+            lbl_t.set_transform(lbl_t.get_transform() + off_down)
+    for lbl_t, flag in zip(ax.get_yticklabels(), y_flags):
+        if flag:
+            lbl_t.set_transform(lbl_t.get_transform() + off_left)
     # Grid lines at piece boundaries (more visible than default)
     ax.grid(axis="both", alpha=0.35, linewidth=0.6, color="#94a3b8", linestyle="--")
     for spine in ax.spines.values():
