@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Patch
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.utils import ImageReader
@@ -504,6 +504,116 @@ def _gen_pattern(
     )
 
 
+def _fit_count(usable: float, dim: float, gap: float) -> int:
+    """Max number of `dim`-sized pieces (with `gap` between them) along `usable`."""
+    if dim <= 0:
+        return 0
+    n = 0
+    while (n + 1) * dim + n * gap <= usable + 1e-9:
+        n += 1
+    return n
+
+
+def _grid_pattern(
+    part: PartSpec, fmt: SheetFormat, margin: float, gap: float, rotated: bool,
+) -> Optional[Pattern]:
+    """Maximal uniform grid of ONE part type on a sheet (rows top-to-bottom).
+
+    For a single part type this is the optimal guillotine packing, which the
+    greedy guillotine packer can miss (it can leave whole rows/columns unused).
+    Pieces are placed row-major from the top-left so trimming surplus later
+    removes whole bottom rows and leaves a clean rectangular offcut.
+    """
+    uw = fmt.width_cm - 2 * margin
+    uh = fmt.height_cm - 2 * margin
+    if uw <= 0 or uh <= 0:
+        return None
+    w, h = (part.height_cm, part.width_cm) if rotated else (part.width_cm, part.height_cm)
+    cols = _fit_count(uw, w, gap)
+    rows = _fit_count(uh, h, gap)
+    if cols < 1 or rows < 1:
+        return None
+    placements: List[Placement] = []
+    idx = 0
+    for r in range(rows):
+        y = r * (h + gap)
+        for c in range(cols):
+            placements.append(Placement(
+                uid=f"{part.name}-grid-{idx}", part_name=part.name,
+                x_cm=c * (w + gap), y_cm=y, width_cm=w, height_cm=h, rotated=rotated,
+            ))
+            idx += 1
+    total = cols * rows
+    sheet_area = uw * uh
+    return Pattern(
+        fmt=fmt, part_counts={part.name: total}, placements=placements,
+        utilization=(total * w * h) / sheet_area if sheet_area > 0 else 0.0,
+        total_items=total,
+    )
+
+
+def _shelf_pattern(
+    parts: List[PartSpec], fmt: SheetFormat, margin: float, gap: float,
+    order: List[PartSpec], force_no_rotate: bool,
+) -> Optional[Pattern]:
+    """Stack full rows ("shelves"), each row one part type, top-to-bottom.
+
+    For each shelf we take the first part (in `order`) that still fits the
+    remaining height, in whichever orientation packs more pieces per row, and
+    fill the row. This produces clean, always-guillotine-feasible mixed layouts.
+    Different `order`s yield different mixes for the selector to combine.
+    """
+    uw = fmt.width_cm - 2 * margin
+    uh = fmt.height_cm - 2 * margin
+    if uw <= 0 or uh <= 0:
+        return None
+    rotate_opts = [False] if force_no_rotate else [False, True]
+    placements: List[Placement] = []
+    counts: Dict[str, int] = {}
+    parts_area = 0.0
+    y = 0.0
+    idx = 0
+    while True:
+        rem_h = uh - y
+        chosen = None  # (cols, w, h, rotated, part)
+        for part in order:
+            best_orient = None
+            for rot in rotate_opts:
+                if rot and (not part.rotatable or part.width_cm == part.height_cm):
+                    continue
+                w, h = (part.height_cm, part.width_cm) if rot else (part.width_cm, part.height_cm)
+                if h > rem_h + 1e-9 or w > uw + 1e-9:
+                    continue
+                cols = _fit_count(uw, w, gap)
+                if cols < 1:
+                    continue
+                if best_orient is None or cols > best_orient[0]:
+                    best_orient = (cols, w, h, rot, part)
+            if best_orient is not None:
+                chosen = best_orient
+                break
+        if chosen is None:
+            break
+        cols, w, h, rot, part = chosen
+        for c in range(cols):
+            placements.append(Placement(
+                uid=f"{part.name}-shelf-{idx}", part_name=part.name,
+                x_cm=c * (w + gap), y_cm=y, width_cm=w, height_cm=h, rotated=rot,
+            ))
+            counts[part.name] = counts.get(part.name, 0) + 1
+            parts_area += w * h
+            idx += 1
+        y += h + gap
+    if not placements:
+        return None
+    sheet_area = uw * uh
+    return Pattern(
+        fmt=fmt, part_counts=counts, placements=placements,
+        utilization=parts_area / sheet_area if sheet_area > 0 else 0.0,
+        total_items=len(placements),
+    )
+
+
 def _generate_all_patterns(
     parts: List[PartSpec],
     formats: List[SheetFormat],
@@ -540,6 +650,27 @@ def _generate_all_patterns(
         for no_rot in rotate_modes:
             _add(_gen_pattern(part_list, fmt, margin, gap, no_rot, h, rng,
                               priority_order=prio, split_rule=sr))
+
+    # Deterministic high-quality seeds (added once, independent of time budget):
+    #  - maximal single-type grids: guarantee the simple grid optimum that the
+    #    greedy guillotine packer can miss;
+    #  - shelf stacks under several part orderings: clean grid-like mixed layouts.
+    # These only ADD candidates, so they can never make the result worse.
+    for fmt in formats:
+        for p in parts:
+            _add(_grid_pattern(p, fmt, margin, gap, rotated=False))
+            if not force_no_rotate and p.rotatable and p.width_cm != p.height_cm:
+                _add(_grid_pattern(p, fmt, margin, gap, rotated=True))
+        if len(parts) >= 2:
+            orderings: List[List[PartSpec]] = [
+                sorted(parts, key=lambda q: -max(q.width_cm, q.height_cm)),
+                sorted(parts, key=lambda q: -(q.width_cm * q.height_cm)),
+                sorted(parts, key=lambda q: -q.height_cm),
+            ]
+            for pivot in parts:
+                orderings.append([pivot] + [q for q in parts if q.name != pivot.name])
+            for order in orderings:
+                _add(_shelf_pattern(parts, fmt, margin, gap, order, force_no_rotate))
 
     trial = 0
     while time.perf_counter() < t_end:
@@ -1056,12 +1187,36 @@ def _part_color(name: str) -> Tuple[float, float, float]:
     return colorsys.hsv_to_rgb((abs(hash(name)) % 360) / 360.0, 0.30, 0.95)
 
 
+# Curated, visually distinct palette. Colours are assigned per drawing in the
+# sorted order of the parts present, so every part in one plan (and its legend)
+# is guaranteed a different colour - unlike a hash, which can collide.
+_PART_PALETTE = [
+    "#f3a683",  # warm orange
+    "#7ec4cf",  # teal
+    "#b8e994",  # light green
+    "#f7b6d2",  # pink
+    "#a29bfe",  # periwinkle
+    "#f6c445",  # gold
+    "#74b9ff",  # blue
+    "#e08283",  # rose
+    "#9b8bd6",  # violet
+    "#78e08f",  # mint
+    "#fab1a0",  # salmon
+    "#c5a880",  # tan
+]
+
+
+def _part_color_map(names: List[str]) -> Dict[str, str]:
+    """Map each distinct part name to a distinct palette colour (stable, sorted)."""
+    return {n: _PART_PALETTE[i % len(_PART_PALETTE)] for i, n in enumerate(sorted(set(names)))}
+
+
 def _dim_label(ax, x1: float, y1: float, x2: float, y2: float, text: str,
-               color: str = "#444", fontsize: float = 6.5) -> None:
+               color: str = "#444", fontsize: float = 6.5, rotation: float = 0) -> None:
     mx, my = (x1 + x2) / 2, (y1 + y2) / 2
     ax.annotate(
         text, xy=(mx, my), fontsize=fontsize, color=color,
-        ha="center", va="center",
+        ha="center", va="center", rotation=rotation,
         bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
     )
 
@@ -1080,14 +1235,25 @@ def draw_sheet_figure(
     pattern_count: int, label: str, margin: float,
 ) -> plt.Figure:
     fw, fh = fmt.width_cm, fmt.height_cm
-    fig, ax = plt.subplots(figsize=(13, 8))
+    # Size the figure to the sheet's aspect ratio so a tall sheet renders tall
+    # (and stays readable) instead of being squashed into a fixed-width canvas.
+    content_w = fw + 19.0   # data span incl. the side dimension lines / labels
+    content_h = fh + 10.0
+    ar = content_h / content_w
+    if ar >= 1.0:           # tall sheet -> tall figure
+        fig_w = 11.0
+        fig_h = max(7.0, min(30.0, 11.0 * ar))
+    else:                   # wide sheet -> wide figure
+        fig_h = 8.0
+        fig_w = max(11.0, min(30.0, 8.0 / ar))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     fig.patch.set_facecolor("#fafbfc")
     ax.set_facecolor("#fafbfc")
 
     title = f"{label}  -  {fmt.name} ({_fmt_mm(fw)} x {_fmt_mm(fh)} mm)"
     if pattern_count > 1:
         title += f"   [{pattern_count}x opakovat]"
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=12, color="#334155")
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=12, color="#334155", loc="left")
     ax.set_xlim(-14, fw + 5)
     ax.set_ylim(-5, fh + 5)
     ax.set_aspect("equal", adjustable="box")
@@ -1105,31 +1271,28 @@ def draw_sheet_figure(
     ax.plot([0, 0], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
     ax.plot([fw, fw], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
 
-    _dim_label(ax, -9.0, 0, -9.0, fh, f"{_fmt_mm(fh)} mm", color="#64748b", fontsize=8)
+    _dim_label(ax, -9.0, 0, -9.0, fh, f"{_fmt_mm(fh)} mm", color="#64748b", fontsize=8, rotation=90)
     ax.plot([-8.0, -8.0], [0, fh], color="#94a3b8", linewidth=0.5)
     ax.plot([-9.2, -6.8], [0, 0], color="#94a3b8", linewidth=0.4)
     ax.plot([-9.2, -6.8], [fh, fh], color="#94a3b8", linewidth=0.4)
 
+    # Draw pieces as plain coloured rectangles (no per-piece text - it is
+    # illegible at high piece counts). Identity/size is shown in the legend.
+    # legend_info: part_name -> [count, nominal_w, nominal_h, colour]
+    color_map = _part_color_map([pl.part_name for pl in placements])
+    legend_info: Dict[str, list] = {}
     for pl in placements:
         x, y = margin + pl.x_cm, margin + pl.y_cm
-        col = _part_color(pl.part_name)
+        col = color_map[pl.part_name]
         ax.add_patch(Rectangle((x, y), pl.width_cm, pl.height_cm,
                                 facecolor=col, edgecolor="#64748b", linewidth=0.5, alpha=0.88))
-
-        min_dim = min(pl.width_cm, pl.height_cm)
-        if pl.width_cm >= 4 and pl.height_cm >= 3:
-            lbl = pl.part_name
-            if pl.rotated:
-                lbl += " (ot.)"
-            fs = max(5.5, min(8.0, min_dim * 0.6))
-            ax.text(x + pl.width_cm / 2, y + pl.height_cm * 0.38, lbl,
-                    fontsize=fs, ha="center", va="center", color="#334155", fontweight="medium")
-
-        if pl.width_cm >= 4 and pl.height_cm >= 2.5:
-            dim_text = f"{_fmt_mm(pl.width_cm)} x {_fmt_mm(pl.height_cm)}"
-            fs2 = max(4.5, min(6.5, min_dim * 0.45))
-            ax.text(x + pl.width_cm / 2, y + pl.height_cm * 0.65, dim_text,
-                    fontsize=fs2, ha="center", va="center", color="#64748b")
+        # Nominal (un-rotated) dimensions for the legend.
+        w0, h0 = (pl.height_cm, pl.width_cm) if pl.rotated else (pl.width_cm, pl.height_cm)
+        info = legend_info.get(pl.part_name)
+        if info is None:
+            legend_info[pl.part_name] = [1, w0, h0, col]
+        else:
+            info[0] += 1
 
     # Custom ticks at piece boundaries.
     # When margin/gap put two cut lines close together (e.g. a piece end and the
@@ -1194,6 +1357,30 @@ def draw_sheet_figure(
     ax.grid(axis="both", alpha=0.35, linewidth=0.6, color="#94a3b8", linestyle="--")
     for spine in ax.spines.values():
         spine.set_visible(False)
+
+    # Legend (replaces per-piece labels): colour swatch + name + size + count.
+    # Anchored to the top-right of the drawing itself (not the top of the whole
+    # canvas) so there is no large empty band above the plan. It grows with the
+    # number of distinct parts.
+    if legend_info:
+        handles = [
+            Patch(facecolor=col, edgecolor="#64748b", linewidth=0.6,
+                  label=f"{name}     {_fmt_mm(w0)} × {_fmt_mm(h0)} mm     {cnt} ks")
+            for name, (cnt, w0, h0, col) in sorted(legend_info.items())
+        ]
+        leg_title = "Dílce      (název  ·  rozměr  ·  ks na archu)"
+        # Lift the legend a fixed number of points above the axes top so it sits
+        # clear of the top X-axis tick labels (which live just above the sheet),
+        # regardless of the rendered figure size.
+        leg_offset = mtransforms.ScaledTranslation(0, 40 / 72, fig.dpi_scale_trans)
+        ax.legend(
+            handles=handles, title=leg_title, loc="lower right",
+            bbox_to_anchor=(1.0, 1.0), bbox_transform=ax.transAxes + leg_offset,
+            fontsize=10, title_fontsize=10, frameon=True, framealpha=0.96,
+            edgecolor="#cbd5e1", borderpad=0.8, labelspacing=0.6,
+            handlelength=1.4, handleheight=1.4, alignment="left",
+        )
+
     fig.tight_layout()
     return fig
 
@@ -1336,9 +1523,22 @@ _CUSTOM_CSS = """
     [data-testid="stSidebar"] {
         background: #efefef !important;
         border-right: 3px solid #0e3572;
+        /* Keep sidebar fixed/visible - prevent collapsing */
+        transform: none !important;
+        visibility: visible !important;
+        min-width: 244px !important;
+        width: 244px !important;
+        margin-left: 0 !important;
     }
     [data-testid="stSidebarContent"] {
         padding-top: 0.25rem !important;
+    }
+    /* Hide the collapse (<<) button so the sidebar cannot be hidden */
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"],
+    button[kind="headerNoPadding"][aria-label*="idebar"] {
+        display: none !important;
     }
 
     /* ---- Hide Deploy toolbar ---- */
@@ -1529,6 +1729,7 @@ def main() -> None:
         page_title="QPV - Nařezový plán",
         page_icon="https://qpv.cz/favicon.ico",
         layout="wide",
+        initial_sidebar_state="expanded",
     )
     st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
 
@@ -2114,7 +2315,7 @@ def main() -> None:
         )
         with st.expander(exp_title, expanded=(len(res.patterns_used) <= 5)):
             fig = draw_sheet_figure(pat.placements, pat.fmt, cnt, label, margin)
-            st.pyplot(fig, clear_figure=False)
+            st.pyplot(fig, clear_figure=False, use_container_width=True)
             plt.close(fig)
 
     # --- PDF export ---
