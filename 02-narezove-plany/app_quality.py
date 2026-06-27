@@ -1233,6 +1233,7 @@ def _fmt_mm(v_cm: float) -> str:
 def draw_sheet_figure(
     placements: List[Placement], fmt: SheetFormat,
     pattern_count: int, label: str, margin: float,
+    font_scale: float = 1.0,
 ) -> plt.Figure:
     fw, fh = fmt.width_cm, fmt.height_cm
     # Size the figure to the sheet's aspect ratio so a tall sheet renders tall
@@ -1253,7 +1254,8 @@ def draw_sheet_figure(
     title = f"{label}  -  {fmt.name} ({_fmt_mm(fw)} x {_fmt_mm(fh)} mm)"
     if pattern_count > 1:
         title += f"   [{pattern_count}x opakovat]"
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=12, color="#334155", loc="left")
+    ax.set_title(title, fontsize=12 * font_scale, fontweight="bold",
+                 pad=12 * font_scale, color="#334155", loc="left")
     ax.set_xlim(-14, fw + 5)
     ax.set_ylim(-5, fh + 5)
     ax.set_aspect("equal", adjustable="box")
@@ -1266,12 +1268,12 @@ def draw_sheet_figure(
         ax.add_patch(Rectangle((margin, margin), uw, uh,
                                 fill=False, edgecolor="#cbd5e1", linewidth=0.7, linestyle="--"))
 
-    _dim_label(ax, 0, -3.0, fw, -3.0, f"{_fmt_mm(fw)} mm", color="#64748b", fontsize=8)
+    _dim_label(ax, 0, -3.0, fw, -3.0, f"{_fmt_mm(fw)} mm", color="#64748b", fontsize=8 * font_scale)
     ax.plot([0, fw], [-2.0, -2.0], color="#94a3b8", linewidth=0.5)
     ax.plot([0, 0], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
     ax.plot([fw, fw], [-3.2, -0.8], color="#94a3b8", linewidth=0.4)
 
-    _dim_label(ax, -9.0, 0, -9.0, fh, f"{_fmt_mm(fh)} mm", color="#64748b", fontsize=8, rotation=90)
+    _dim_label(ax, -9.0, 0, -9.0, fh, f"{_fmt_mm(fh)} mm", color="#64748b", fontsize=8 * font_scale, rotation=90)
     ax.plot([-8.0, -8.0], [0, fh], color="#94a3b8", linewidth=0.5)
     ax.plot([-9.2, -6.8], [0, 0], color="#94a3b8", linewidth=0.4)
     ax.plot([-9.2, -6.8], [fh, fh], color="#94a3b8", linewidth=0.4)
@@ -1321,7 +1323,7 @@ def draw_sheet_figure(
         | {margin + pl.y_cm for pl in placements}
         | {margin + pl.y_cm + pl.height_cm for pl in placements}
     )
-    _TICK_FS = 5.0
+    _TICK_FS = 5.0 * font_scale
     # Two levels of tick labels get slightly different colours so the staggered
     # rows are easy to tell apart (level 0 = dark, level 1 = lighter).
     _LVL_COLORS = ["#1e3a5f", "#8aa0c4"]
@@ -1338,9 +1340,9 @@ def draw_sheet_figure(
     # Y: left labels go further left.
     x_flags = _stagger_flags(x_edges, fw * 0.04)
     y_flags = _stagger_flags(y_edges, fh * 0.04)
-    off_down = mtransforms.ScaledTranslation(0, -8 / 72, fig.dpi_scale_trans)
-    off_up = mtransforms.ScaledTranslation(0, 8 / 72, fig.dpi_scale_trans)
-    off_left = mtransforms.ScaledTranslation(-11 / 72, 0, fig.dpi_scale_trans)
+    off_down = mtransforms.ScaledTranslation(0, -8 * font_scale / 72, fig.dpi_scale_trans)
+    off_up = mtransforms.ScaledTranslation(0, 8 * font_scale / 72, fig.dpi_scale_trans)
+    off_left = mtransforms.ScaledTranslation(-11 * font_scale / 72, 0, fig.dpi_scale_trans)
     for tick, flag in zip(ax.xaxis.get_major_ticks(), x_flags):
         col = _LVL_COLORS[flag]
         tick.label1.set_color(col)
@@ -1372,11 +1374,11 @@ def draw_sheet_figure(
         # Lift the legend a fixed number of points above the axes top so it sits
         # clear of the top X-axis tick labels (which live just above the sheet),
         # regardless of the rendered figure size.
-        leg_offset = mtransforms.ScaledTranslation(0, 40 / 72, fig.dpi_scale_trans)
+        leg_offset = mtransforms.ScaledTranslation(0, 40 * font_scale / 72, fig.dpi_scale_trans)
         ax.legend(
             handles=handles, title=leg_title, loc="lower right",
             bbox_to_anchor=(1.0, 1.0), bbox_transform=ax.transAxes + leg_offset,
-            fontsize=10, title_fontsize=10, frameon=True, framealpha=0.96,
+            fontsize=10 * font_scale, title_fontsize=10 * font_scale, frameon=True, framealpha=0.96,
             edgecolor="#cbd5e1", borderpad=0.8, labelspacing=0.6,
             handlelength=1.4, handleheight=1.4, alignment="left",
         )
@@ -1389,41 +1391,65 @@ def draw_sheet_figure(
 # PDF export
 # ---------------------------------------------------------------------------
 
-def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes]) -> bytes:
+_PDF_HEAD_H = 58  # height of the blue header band (pt)
+
+
+def _render_pattern_image(pat: Pattern, cnt: int, label: str, margin: float):
+    """Render one pattern to an RGB PIL image with print-sized (larger) fonts."""
+    from PIL import Image
+    fig = draw_sheet_figure(pat.placements, pat.fmt, cnt, label, margin, font_scale=2.0)
+    bio = io.BytesIO()
+    fig.savefig(bio, format="png", dpi=200, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    bio.seek(0)
+    return Image.open(bio).convert("RGB")
+
+
+def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes],
+              mode: str = "print") -> bytes:
+    """Build the cut-plan PDF.
+
+    mode="screen": one tall page per pattern, drawing fills the page width so
+                   numbers stay large (scroll to read). Best for viewing on a PC.
+    mode="print":  each pattern tiled across standard A4 portrait pages at a
+                   readable scale. Best for printing.
+    """
     if logo is None:
         logo = _load_default_logo()
     buf = io.BytesIO()
-    pdf = pdf_canvas.Canvas(buf, pagesize=landscape(A4))
-    pw, ph = landscape(A4)
+    pdf = pdf_canvas.Canvas(buf)
+    A4W, A4H = A4  # portrait 595 x 842 pt
+    MX = 16        # left/right margin for the drawing
 
-    def head(title: str) -> None:
-        # QPV-blue header band (matches qpv.cz)
+    def head(pw: float, ph: float, title: str) -> None:
         pdf.setFillColor(colors.HexColor("#0e3572"))
-        pdf.rect(0, ph - 65, pw, 65, stroke=0, fill=1)
+        pdf.rect(0, ph - _PDF_HEAD_H, pw, _PDF_HEAD_H, stroke=0, fill=1)
         if logo:
-            pdf.drawImage(ImageReader(io.BytesIO(logo)), 16, ph - 57, width=72, height=38,
-                          preserveAspectRatio=True, mask="auto")
+            pdf.drawImage(ImageReader(io.BytesIO(logo)), 14, ph - _PDF_HEAD_H + 10,
+                          width=64, height=34, preserveAspectRatio=True, mask="auto")
         else:
             pdf.setFillColor(colors.white)
-            pdf.setFont(_PDF_FONT_BOLD, 22)
-            pdf.drawString(24, ph - 47, "QPV")
+            pdf.setFont(_PDF_FONT_BOLD, 20)
+            pdf.drawString(20, ph - 40, "QPV")
         pdf.setFillColor(colors.white)
-        pdf.setFont(_PDF_FONT_BOLD, 14)
-        pdf.drawString(100, ph - 40, title)
+        pdf.setFont(_PDF_FONT_BOLD, 13)
+        pdf.drawString(92, ph - 36, title)
         pdf.setFont(_PDF_FONT, 8)
         pdf.setFillColor(colors.HexColor("#a8c0e8"))
-        pdf.drawRightString(pw - 16, ph - 40, "qpv.cz")
+        pdf.drawRightString(pw - 14, ph - 36, "qpv.cz")
 
-    # Summary page
-    head("Nařezový plán - souhrn")
+    # ---- Summary page (A4 portrait) ----
+    pdf.setPageSize((A4W, A4H))
+    head(A4W, A4H, "Nařezový plán - souhrn")
     pdf.setFillColor(colors.HexColor("#334155"))
     pdf.setFont(_PDF_FONT, 10)
-    y0 = ph - 82
+    y0 = A4H - _PDF_HEAD_H - 24
     pdf.drawString(20, y0,      f"Celkem archů: {len(res.sheet_results)}")
     pdf.drawString(20, y0 - 16, f"Výtěžnost materiálu: {res.utilization_ratio * 100.0:.2f} %")
-    pdf.drawString(280, y0,      f"Použitých formátů: {res.formats_used}")
-    pdf.drawString(280, y0 - 16, f"Odhadovaný počet řezů: {res.total_cuts}")
-    pdf.drawString(280, y0 - 32, f"Otestováno kombinací: {res.attempts}")
+    pdf.drawString(300, y0,      f"Použitých formátů: {res.formats_used}")
+    pdf.drawString(300, y0 - 16, f"Odhadovaný počet řezů: {res.total_cuts}")
+    pdf.drawString(300, y0 - 32, f"Otestováno kombinací: {res.attempts}")
     pdf.drawString(20, y0 - 52, f"Doba výpočtu: {res.elapsed_sec:.1f} s")
 
     y_off = y0 - 78
@@ -1443,22 +1469,70 @@ def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes]) -> 
         y_off -= 15
         if y_off < 40:
             pdf.showPage()
-            head("Nařezový plán - souhrn (pokračování)")
-            y_off = ph - 82
+            pdf.setPageSize((A4W, A4H))
+            head(A4W, A4H, "Nařezový plán - souhrn (pokračování)")
+            y_off = A4H - _PDF_HEAD_H - 24
     pdf.showPage()
 
-    # One page per pattern
+    # ---- One (tall) or several (A4) pages per pattern ----
     for (pat, cnt), (setup_num, is_partial) in zip(res.patterns_used, pdf_setup):
         label = f"Vzor {setup_num}" + (" (zbytek)" if is_partial else "")
-        head(f"{label} / {len(res.patterns_used)}  ({cnt}x)")
-        fig = draw_sheet_figure(pat.placements, pat.fmt, cnt, label, margin)
-        img = io.BytesIO()
-        fig.savefig(img, format="png", dpi=170, bbox_inches="tight")
-        plt.close(fig)
-        img.seek(0)
-        pdf.drawImage(ImageReader(img), 16, 20, width=pw - 32, height=ph - 110,
-                      preserveAspectRatio=True, mask="auto")
-        pdf.showPage()
+        img = _render_pattern_image(pat, cnt, label, margin)
+        iw, ih = img.size
+        draw_w = A4W - 2 * MX
+        scale = draw_w / iw  # px -> pt; the drawing always fills the page width
+
+        if mode == "screen":
+            # Single page sized to the whole drawing.
+            draw_h = ih * scale
+            page_h = _PDF_HEAD_H + 16 + draw_h + 16
+            pdf.setPageSize((A4W, page_h))
+            head(A4W, page_h, f"{label}  ({cnt}x)")
+            bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+            pdf.drawImage(ImageReader(bio), MX, 16, width=draw_w, height=draw_h, mask="auto")
+            pdf.showPage()
+        else:
+            # Tile the drawing top-to-bottom across A4 pages. Trim trailing empty
+            # sheet area (e.g. a partly-filled "zbytek") so it does not produce
+            # near-blank pages: find the last image row that still contains a
+            # coloured piece and only tile down to there.
+            import numpy as np
+            arr = np.asarray(img)
+            # Find the last row that still holds a piece. Pieces are large solid
+            # colour fills, so a piece row has MANY coloured pixels; the blue
+            # axis numbers and grey grid (which run the full sheet height) are
+            # thin and never fill a row, so a per-row count cleanly excludes them.
+            sub = arr[:, int(iw * 0.20):, :]
+            sat = sub.max(axis=2).astype(int) - sub.min(axis=2).astype(int)
+            row_filled = (sat > 45).sum(axis=1)
+            content_rows = np.where(row_filled > 0.25 * sub.shape[1])[0]
+            if len(content_rows):
+                tile_ih = min(ih, int(content_rows[-1]) + int(ih * 0.015) + 1)
+            else:
+                tile_ih = ih
+            avail_h = A4H - _PDF_HEAD_H - 16 - 16
+            band_px = max(1, int(avail_h / scale))
+            overlap = int(band_px * 0.04)
+            step = max(1, band_px - overlap)
+            n_pages = max(1, (tile_ih + step - 1) // step)
+            top = 0
+            page_i = 0
+            while top < tile_ih:
+                page_i += 1
+                bottom = min(tile_ih, top + band_px)
+                crop = img.crop((0, top, iw, bottom))
+                strip_h = (bottom - top) * scale
+                pdf.setPageSize((A4W, A4H))
+                suffix = f"  -  str. {page_i}/{n_pages}" if n_pages > 1 else ""
+                head(A4W, A4H, f"{label}  ({cnt}x){suffix}")
+                bio = io.BytesIO(); crop.save(bio, format="PNG"); bio.seek(0)
+                y = A4H - _PDF_HEAD_H - 16 - strip_h
+                pdf.drawImage(ImageReader(bio), MX, y, width=draw_w, height=strip_h, mask="auto")
+                pdf.showPage()
+                if bottom >= tile_ih:
+                    break
+                top = bottom - overlap
+
     pdf.save()
     return buf.getvalue()
 
@@ -2320,20 +2394,25 @@ def main() -> None:
 
     # --- PDF export ---
     st.markdown("##### Export do PDF")
-    col_dl, col_info = st.columns([2, 3])
-    with col_dl:
+    col_screen, col_print = st.columns(2)
+    with col_screen:
         st.download_button(
-            "Stáhnout PDF report",
-            data=build_pdf(res, margin, logo_bytes),
-            file_name="qpv-narezovy-plan.pdf",
+            "📱 PDF pro obrazovku (PC / mobil)",
+            data=build_pdf(res, margin, logo_bytes, mode="screen"),
+            file_name="qpv-narezovy-plan-obrazovka.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
-    with col_info:
-        st.caption(
-            "PDF obsahuje souhrnnou stránku a detailní nákres "
-            "každého vzoru rozložení včetně rozměrů."
+        st.caption("Jedna dlouhá stránka na arch, velká čitelná čísla — scrolluješ dolů.")
+    with col_print:
+        st.download_button(
+            "🖨️ PDF pro tisk (A4)",
+            data=build_pdf(res, margin, logo_bytes, mode="print"),
+            file_name="qpv-narezovy-plan-tisk.pdf",
+            mime="application/pdf",
+            use_container_width=True,
         )
+        st.caption("Vysoký arch rozdělený na navazující A4 stránky — čitelné i vytištěné.")
 
 
 
