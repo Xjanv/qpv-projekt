@@ -504,6 +504,116 @@ def _gen_pattern(
     )
 
 
+def _fit_count(usable: float, dim: float, gap: float) -> int:
+    """Max number of `dim`-sized pieces (with `gap` between them) along `usable`."""
+    if dim <= 0:
+        return 0
+    n = 0
+    while (n + 1) * dim + n * gap <= usable + 1e-9:
+        n += 1
+    return n
+
+
+def _grid_pattern(
+    part: PartSpec, fmt: SheetFormat, margin: float, gap: float, rotated: bool,
+) -> Optional[Pattern]:
+    """Maximal uniform grid of ONE part type on a sheet (rows top-to-bottom).
+
+    For a single part type this is the optimal guillotine packing, which the
+    greedy guillotine packer can miss (it can leave whole rows/columns unused).
+    Pieces are placed row-major from the top-left so trimming surplus later
+    removes whole bottom rows and leaves a clean rectangular offcut.
+    """
+    uw = fmt.width_cm - 2 * margin
+    uh = fmt.height_cm - 2 * margin
+    if uw <= 0 or uh <= 0:
+        return None
+    w, h = (part.height_cm, part.width_cm) if rotated else (part.width_cm, part.height_cm)
+    cols = _fit_count(uw, w, gap)
+    rows = _fit_count(uh, h, gap)
+    if cols < 1 or rows < 1:
+        return None
+    placements: List[Placement] = []
+    idx = 0
+    for r in range(rows):
+        y = r * (h + gap)
+        for c in range(cols):
+            placements.append(Placement(
+                uid=f"{part.name}-grid-{idx}", part_name=part.name,
+                x_cm=c * (w + gap), y_cm=y, width_cm=w, height_cm=h, rotated=rotated,
+            ))
+            idx += 1
+    total = cols * rows
+    sheet_area = uw * uh
+    return Pattern(
+        fmt=fmt, part_counts={part.name: total}, placements=placements,
+        utilization=(total * w * h) / sheet_area if sheet_area > 0 else 0.0,
+        total_items=total,
+    )
+
+
+def _shelf_pattern(
+    parts: List[PartSpec], fmt: SheetFormat, margin: float, gap: float,
+    order: List[PartSpec], force_no_rotate: bool,
+) -> Optional[Pattern]:
+    """Stack full rows ("shelves"), each row one part type, top-to-bottom.
+
+    For each shelf we take the first part (in `order`) that still fits the
+    remaining height, in whichever orientation packs more pieces per row, and
+    fill the row. This produces clean, always-guillotine-feasible mixed layouts.
+    Different `order`s yield different mixes for the selector to combine.
+    """
+    uw = fmt.width_cm - 2 * margin
+    uh = fmt.height_cm - 2 * margin
+    if uw <= 0 or uh <= 0:
+        return None
+    rotate_opts = [False] if force_no_rotate else [False, True]
+    placements: List[Placement] = []
+    counts: Dict[str, int] = {}
+    parts_area = 0.0
+    y = 0.0
+    idx = 0
+    while True:
+        rem_h = uh - y
+        chosen = None  # (cols, w, h, rotated, part)
+        for part in order:
+            best_orient = None
+            for rot in rotate_opts:
+                if rot and (not part.rotatable or part.width_cm == part.height_cm):
+                    continue
+                w, h = (part.height_cm, part.width_cm) if rot else (part.width_cm, part.height_cm)
+                if h > rem_h + 1e-9 or w > uw + 1e-9:
+                    continue
+                cols = _fit_count(uw, w, gap)
+                if cols < 1:
+                    continue
+                if best_orient is None or cols > best_orient[0]:
+                    best_orient = (cols, w, h, rot, part)
+            if best_orient is not None:
+                chosen = best_orient
+                break
+        if chosen is None:
+            break
+        cols, w, h, rot, part = chosen
+        for c in range(cols):
+            placements.append(Placement(
+                uid=f"{part.name}-shelf-{idx}", part_name=part.name,
+                x_cm=c * (w + gap), y_cm=y, width_cm=w, height_cm=h, rotated=rot,
+            ))
+            counts[part.name] = counts.get(part.name, 0) + 1
+            parts_area += w * h
+            idx += 1
+        y += h + gap
+    if not placements:
+        return None
+    sheet_area = uw * uh
+    return Pattern(
+        fmt=fmt, part_counts=counts, placements=placements,
+        utilization=parts_area / sheet_area if sheet_area > 0 else 0.0,
+        total_items=len(placements),
+    )
+
+
 def _generate_all_patterns(
     parts: List[PartSpec],
     formats: List[SheetFormat],
@@ -540,6 +650,27 @@ def _generate_all_patterns(
         for no_rot in rotate_modes:
             _add(_gen_pattern(part_list, fmt, margin, gap, no_rot, h, rng,
                               priority_order=prio, split_rule=sr))
+
+    # Deterministic high-quality seeds (added once, independent of time budget):
+    #  - maximal single-type grids: guarantee the simple grid optimum that the
+    #    greedy guillotine packer can miss;
+    #  - shelf stacks under several part orderings: clean grid-like mixed layouts.
+    # These only ADD candidates, so they can never make the result worse.
+    for fmt in formats:
+        for p in parts:
+            _add(_grid_pattern(p, fmt, margin, gap, rotated=False))
+            if not force_no_rotate and p.rotatable and p.width_cm != p.height_cm:
+                _add(_grid_pattern(p, fmt, margin, gap, rotated=True))
+        if len(parts) >= 2:
+            orderings: List[List[PartSpec]] = [
+                sorted(parts, key=lambda q: -max(q.width_cm, q.height_cm)),
+                sorted(parts, key=lambda q: -(q.width_cm * q.height_cm)),
+                sorted(parts, key=lambda q: -q.height_cm),
+            ]
+            for pivot in parts:
+                orderings.append([pivot] + [q for q in parts if q.name != pivot.name])
+            for order in orderings:
+                _add(_shelf_pattern(parts, fmt, margin, gap, order, force_no_rotate))
 
     trial = 0
     while time.perf_counter() < t_end:
