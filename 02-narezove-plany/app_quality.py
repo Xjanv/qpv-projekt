@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html as html_mod
 import io
 import json
@@ -262,8 +263,13 @@ _DEFAULT_FORMATS_DF = pd.DataFrame({
 })
 
 
-def df_to_parts(df: "pd.DataFrame") -> List[PartSpec]:
-    rows = df.dropna(subset=["Název", "Šířka (mm)", "Výška (mm)", "Počet kusů"])
+def df_to_parts(df: "pd.DataFrame", require_qty: bool = True) -> List[PartSpec]:
+    # In "densest layout" mode quantities are irrelevant, so we don't require
+    # the "Počet kusů" column to be filled and default it to 1.
+    subset = ["Název", "Šířka (mm)", "Výška (mm)"]
+    if require_qty:
+        subset.append("Počet kusů")
+    rows = df.dropna(subset=subset)
     rows = rows[rows["Název"].astype(str).str.strip() != ""]
     if rows.empty:
         raise ValueError("Seznam dílců je prázdný. Zadej alespoň jeden dílec.")
@@ -272,10 +278,13 @@ def df_to_parts(df: "pd.DataFrame") -> List[PartSpec]:
         name = str(row["Název"]).strip()
         # UI stores millimetres; the algorithm works internally in centimetres.
         w, h = float(row["Šířka (mm)"]) / 10.0, float(row["Výška (mm)"]) / 10.0
-        q = int(row["Počet kusů"])
+        raw_q = row.get("Počet kusů")
+        q = int(raw_q) if (require_qty and pd.notna(raw_q)) else 1
         rotatable = bool(row.get("Lze otočit", False))
         if w <= 0 or h <= 0 or q <= 0:
-            raise ValueError(f"Řádek {i} ({name}): šířka, výška i počet kusů musí být větší než 0.")
+            msg = "šířka a výška musí být větší než 0." if not require_qty \
+                else "šířka, výška i počet kusů musí být větší než 0."
+            raise ValueError(f"Řádek {i} ({name}): {msg}")
         out.append(PartSpec(name=name, width_cm=w, height_cm=h, qty=q, rotatable=rotatable))
     names = [p.name for p in out]
     dupes = sorted({n for n in names if names.count(n) > 1})
@@ -704,6 +713,75 @@ def _generate_all_patterns(
             break
 
     return list(seen.values())
+
+
+def densest_per_sheet(
+    parts: List[PartSpec],
+    formats: List[SheetFormat],
+    margin: float,
+    gap: float,
+    force_no_rotate: bool,
+    budget_s: float = 6.0,
+) -> List[Tuple[SheetFormat, Optional[Pattern]]]:
+    """For EACH sheet format independently, find the single densest layout.
+
+    Used by the "Nejhustší rozkres na arch" mode: every sheet is a different
+    material that must be cut on its own, so we don't combine or select between
+    sheets — we just report the fullest layout for each one. Quantities are
+    ignored (parts are treated as unlimited).
+
+    Returns one (format, best_pattern) per input format, in input order.
+    best_pattern is None when nothing fits the sheet.
+    """
+    results: List[Tuple[SheetFormat, Optional[Pattern]]] = []
+    per_fmt_budget = max(1.0, budget_s / max(len(formats), 1))
+    for fmt in formats:
+        candidates = _generate_all_patterns(
+            parts, [fmt], margin, gap, force_no_rotate, per_fmt_budget,
+        )
+        best = max(
+            candidates,
+            key=lambda p: (p.total_items, p.utilization),
+            default=None,
+        )
+        results.append((fmt, best))
+    return results
+
+
+def densest_to_result(
+    dres: List[Tuple[SheetFormat, Optional[Pattern]]], margin: float,
+) -> OptimizationResult:
+    """Wrap densest-per-sheet output into an OptimizationResult so the existing
+    PDF builder (screen/print modes) can be reused as-is. Each sheet appears once."""
+    patterns_used: List[Tuple[Pattern, int]] = [
+        (pat, 1) for _, pat in dres if pat is not None
+    ]
+    sheet_results: List[SheetResult] = [
+        SheetResult(fmt=pat.fmt, placements=list(pat.placements), pattern_id=i)
+        for i, (pat, _) in enumerate(patterns_used)
+    ]
+    total_parts = sum(
+        sum(pl.width_cm * pl.height_cm for pl in pat.placements)
+        for pat, _ in patterns_used
+    )
+    total_usable = sum(
+        (pat.fmt.width_cm - 2 * margin) * (pat.fmt.height_cm - 2 * margin)
+        for pat, _ in patterns_used
+    )
+    util = total_parts / total_usable if total_usable > 0 else 0.0
+    total_cuts = sum(_count_cuts_pattern(pat) for pat, _ in patterns_used)
+    return OptimizationResult(
+        sheet_results=sheet_results,
+        patterns_used=patterns_used,
+        utilization_ratio=util,
+        total_cost=0.0,
+        attempts=0,
+        elapsed_sec=0.0,
+        lower_bound_sheets=len(patterns_used),
+        objectives_score=0.0,
+        formats_used=len({pat.fmt.name for pat, _ in patterns_used}),
+        total_cuts=total_cuts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1537,6 +1615,39 @@ def build_pdf(res: OptimizationResult, margin: float, logo: Optional[bytes],
     return buf.getvalue()
 
 
+def _pdf_cache_key(res: OptimizationResult, margin: float, has_logo: bool) -> str:
+    """Compact hash uniquely identifying a PDF's visual content.
+
+    st.download_button needs its `data` ready at render time, so build_pdf would
+    otherwise run on every rerun. We key a cache on everything that affects the
+    drawing (sheet geometry + every placement + margin + logo presence) so the
+    expensive render happens once per distinct result, not once per rerun.
+    """
+    parts: List[str] = [f"m{margin:.3f}", f"l{int(has_logo)}"]
+    for pat, cnt in res.patterns_used:
+        pls = ";".join(
+            f"{pl.x_cm:.2f},{pl.y_cm:.2f},{pl.width_cm:.2f},{pl.height_cm:.2f},{int(pl.rotated)}"
+            for pl in pat.placements
+        )
+        parts.append(f"{pat.fmt.name}|{pat.fmt.width_cm}x{pat.fmt.height_cm}|{cnt}|{pls}")
+    raw = "||".join(parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _build_pdf_cached(cache_key: str, mode: str, _res: OptimizationResult,
+                      _margin: float, _logo: Optional[bytes]) -> bytes:
+    """Cached PDF render. `cache_key`+`mode` are hashed for the cache identity;
+    the heavy objects (prefixed with _) are passed through without hashing."""
+    return build_pdf(_res, _margin, _logo, mode=mode)
+
+
+# Apply Streamlit's cache only when running under the real Streamlit (unit tests
+# mock the module and have no cache_data); falls back to the plain function.
+_cache_data = getattr(st, "cache_data", None)
+if _cache_data is not None:
+    _build_pdf_cached = _cache_data(show_spinner=False, max_entries=16)(_build_pdf_cached)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
@@ -1956,6 +2067,25 @@ def main() -> None:
 
     # ======================== SIDEBAR ========================
     with st.sidebar:
+        st.markdown("<div class='sidebar-section'>Typ úlohy</div>", unsafe_allow_html=True)
+        mode = st.radio(
+            "Co má program spočítat",
+            options=["Pokrýt zakázku", "Nejhustší rozkres na arch"],
+            index=0,
+            label_visibility="collapsed",
+            help=(
+                "**Pokrýt zakázku** — zadáte počty kusů a program sestaví plán, "
+                "který pokryje celou zakázku s co nejmenším odpadem. Archy bere jako "
+                "vzájemně zaměnitelnou zásobu.\n\n"
+                "**Nejhustší rozkres na arch** — pro každý arch zvlášť ukáže nejhustší "
+                "možné rozložení (nejvíc kusů na arch). Počty kusů se neřeší. "
+                "Vhodné, když má každý arch jiný materiál a chcete jen vidět, "
+                "jak nejlíp ho zaplnit."
+            ),
+        )
+        densest_mode = (mode == "Nejhustší rozkres na arch")
+        st.divider()
+
         st.markdown("<div class='sidebar-section'>Nastavení řezu</div>", unsafe_allow_html=True)
         st.caption("Nastavte, kolik místa se na archu ztratí u okrajů a jak velká mezera bude mezi jednotlivými dílci. Program tyto hodnoty zohlední při výpočtu — výsledné rozložení pak bude přesně odpovídat tomu, co stroj skutečně zvládne.")
 
@@ -1997,85 +2127,93 @@ def main() -> None:
             ),
         )
         force_no_rotate = not allow_rotate
-        max_patterns = st.number_input(
-            "Maximální počet variant nařezání (0 = bez omezení)",
-            min_value=0, max_value=50, value=0, step=1,
-            help=(
-                "Určuje, kolik různých způsobů rozmístění může výsledný plán obsahovat. "
-                "Každá varianta se pak opakuje tolikrát, kolik je potřeba.\n\n"
-                "Příklad: hodnota 2 = vzniknou nejvýše 2 různé varianty nařezání. "
-                "Hodnota 0 = program si počet určí sám."
-            ),
-        )
-        if max_patterns > 0:
-            word = "variantu" if max_patterns == 1 else ("varianty" if max_patterns < 5 else "variant")
-            st.info(
-                f"Aktivní limit: max. **{max_patterns}** {word} nařezání. "
-                f"Může vést k mírně horším výsledkům.",
-                icon="ℹ️",
+        if not densest_mode:
+            max_patterns = st.number_input(
+                "Maximální počet variant nařezání (0 = bez omezení)",
+                min_value=0, max_value=50, value=0, step=1,
+                help=(
+                    "Určuje, kolik různých způsobů rozmístění může výsledný plán obsahovat. "
+                    "Každá varianta se pak opakuje tolikrát, kolik je potřeba.\n\n"
+                    "Příklad: hodnota 2 = vzniknou nejvýše 2 různé varianty nařezání. "
+                    "Hodnota 0 = program si počet určí sám."
+                ),
             )
-
-        st.divider()
-        st.markdown("<div class='sidebar-section'>Co optimalizovat</div>", unsafe_allow_html=True)
-        st.caption(
-            "Posuňte posuvníky podle toho, co chcete optimalizovat. "
-            "Součet se automaticky přepočítá na 100 %."
-        )
-        w_waste = st.slider(
-            "Co nejmenší odpad", 0.0, 1.0, 0.50, 0.05,
-            help=(
-                "Určuje, jak moc se program snaží využít každý arch do posledního centimetru. "
-                "Čím vyšší hodnota, tím méně materiálu skončí jako odpad. "
-                "Příklad: při výtěžnosti 95 % se z každého archu skutečně vyřeže 95 % plochy. "
-                "Nevýhoda: při velmi vysoké hodnotě může program upřednostnit složitější rozložení nebo dražší arch. "
-                "Pokud zároveň omezíte počet variant nařezání, platí toto: program nejprve dodrží limit variant jako pevnou podmínku "
-                "a teprve v jeho rámci hledá rozložení s co nejmenším odpadem."
-            ),
-        )
-        w_sheets = st.slider(
-            "Co nejméně archů", 0.0, 1.0, 0.25, 0.05,
-            help=(
-                "Určuje, jak moc se program snaží použít co nejméně archů celkem. "
-                "Méně archů = nižší spotřeba materiálu. "
-                "Nevýhoda: program může zvolit složitější rozložení nebo přijmout větší odpad, "
-                "aby snížil počet archů. "
-                "Pokud zároveň omezíte počet variant nařezání, program nejprve dodrží tento limit "
-                "a teprve v jeho rámci minimalizuje počet archů."
-            ),
-        )
-        w_cuts = st.slider(
-            "Méně řezů", 0.0, 1.0, 0.00, 0.05,
-            help=(
-                "Určuje, jak moc se program snaží snížit celkový počet řezů na každém archu. "
-                "Méně řezů = jednodušší a rychlejší zpracování na stroji. "
-                "Nevýhoda: program může přijmout větší odpad nebo použít více archů, "
-                "aby dosáhl jednodušších rozložení. "
-                "Pokud omezíte počet variant nařezání, program ho dodrží jako pevnou podmínku "
-                "a počet řezů optimalizuje až v jeho rámci."
-            ),
-        )
-        w_cost = 0.0
-        w_formats = 0.0
-        obj = Objectives(w_cost=w_cost, w_sheets=w_sheets, w_waste=w_waste,
-                         w_cuts=w_cuts, w_formats=w_formats)
-
-        pct = obj.pct()
-        total_set = w_sheets + w_waste + w_cuts
-        if total_set > 0:
-            st.caption("**Rozdělení priorit:**")
-            ordered = [
-                ("Odpad (vyteznost)", "Odpad"),
-                ("Pocet archu", "Počet archů"),
-                ("Pocet rezu", "Řezy"),
-            ]
-            for key, nice in ordered:
-                p = pct.get(key, 0)
-                if p > 0:
-                    st.progress(int(p), text=f"{nice}: {int(p)} %")
+            if max_patterns > 0:
+                word = "variantu" if max_patterns == 1 else ("varianty" if max_patterns < 5 else "variant")
+                st.info(
+                    f"Aktivní limit: max. **{max_patterns}** {word} nařezání. "
+                    f"Může vést k mírně horším výsledkům.",
+                    icon="ℹ️",
+                )
         else:
-            st.warning("Nastavte alespoň jeden cíl (posuňte některý posuvník doprava).")
+            max_patterns = 0
 
-        logo_bytes = default_logo
+        if densest_mode:
+            # No optimisation weights in densest mode — always maximise fill.
+            obj = Objectives(w_cost=0.0, w_sheets=0.0, w_waste=1.0, w_cuts=0.0, w_formats=0.0)
+            logo_bytes = default_logo
+        else:
+            st.divider()
+            st.markdown("<div class='sidebar-section'>Co optimalizovat</div>", unsafe_allow_html=True)
+            st.caption(
+                "Posuňte posuvníky podle toho, co chcete optimalizovat. "
+                "Součet se automaticky přepočítá na 100 %."
+            )
+            w_waste = st.slider(
+                "Co nejmenší odpad", 0.0, 1.0, 0.50, 0.05,
+                help=(
+                    "Určuje, jak moc se program snaží využít každý arch do posledního centimetru. "
+                    "Čím vyšší hodnota, tím méně materiálu skončí jako odpad. "
+                    "Příklad: při výtěžnosti 95 % se z každého archu skutečně vyřeže 95 % plochy. "
+                    "Nevýhoda: při velmi vysoké hodnotě může program upřednostnit složitější rozložení nebo dražší arch. "
+                    "Pokud zároveň omezíte počet variant nařezání, platí toto: program nejprve dodrží limit variant jako pevnou podmínku "
+                    "a teprve v jeho rámci hledá rozložení s co nejmenším odpadem."
+                ),
+            )
+            w_sheets = st.slider(
+                "Co nejméně archů", 0.0, 1.0, 0.25, 0.05,
+                help=(
+                    "Určuje, jak moc se program snaží použít co nejméně archů celkem. "
+                    "Méně archů = nižší spotřeba materiálu. "
+                    "Nevýhoda: program může zvolit složitější rozložení nebo přijmout větší odpad, "
+                    "aby snížil počet archů. "
+                    "Pokud zároveň omezíte počet variant nařezání, program nejprve dodrží tento limit "
+                    "a teprve v jeho rámci minimalizuje počet archů."
+                ),
+            )
+            w_cuts = st.slider(
+                "Méně řezů", 0.0, 1.0, 0.00, 0.05,
+                help=(
+                    "Určuje, jak moc se program snaží snížit celkový počet řezů na každém archu. "
+                    "Méně řezů = jednodušší a rychlejší zpracování na stroji. "
+                    "Nevýhoda: program může přijmout větší odpad nebo použít více archů, "
+                    "aby dosáhl jednodušších rozložení. "
+                    "Pokud omezíte počet variant nařezání, program ho dodrží jako pevnou podmínku "
+                    "a počet řezů optimalizuje až v jeho rámci."
+                ),
+            )
+            w_cost = 0.0
+            w_formats = 0.0
+            obj = Objectives(w_cost=w_cost, w_sheets=w_sheets, w_waste=w_waste,
+                             w_cuts=w_cuts, w_formats=w_formats)
+
+            pct = obj.pct()
+            total_set = w_sheets + w_waste + w_cuts
+            if total_set > 0:
+                st.caption("**Rozdělení priorit:**")
+                ordered = [
+                    ("Odpad (vyteznost)", "Odpad"),
+                    ("Pocet archu", "Počet archů"),
+                    ("Pocet rezu", "Řezy"),
+                ]
+                for key, nice in ordered:
+                    p = pct.get(key, 0)
+                    if p > 0:
+                        st.progress(int(p), text=f"{nice}: {int(p)} %")
+            else:
+                st.warning("Nastavte alespoň jeden cíl (posuňte některý posuvník doprava).")
+
+            logo_bytes = default_logo
 
     # ======================== MAIN AREA ========================
     col_parts, col_fmt = st.columns(2)
@@ -2084,7 +2222,9 @@ def main() -> None:
         "Název": st.column_config.TextColumn("Název", help="Název nebo označení dílce.", width="medium"),
         "Šířka (mm)": st.column_config.NumberColumn("Šířka (mm)", min_value=1.0, step=1.0, format="%g", help="Šířka dílce v mm.", width=90),
         "Výška (mm)": st.column_config.NumberColumn("Výška (mm)", min_value=1.0, step=1.0, format="%g", help="Výška dílce v mm.", width=90),
-        "Počet kusů": st.column_config.NumberColumn("Ks", min_value=1, step=1, help="Celkový počet kusů.", width=60),
+        # In densest mode quantities are irrelevant → hide the column (None).
+        "Počet kusů": (None if densest_mode else
+                       st.column_config.NumberColumn("Ks", min_value=1, step=1, help="Celkový počet kusů.", width=60)),
         "Lze otočit": st.column_config.CheckboxColumn("Otočit ⓘ", help="Program smí otočit dílec o 90°, což může zlepšit využití plochy archu.", width=80),
     }
     _FMTS_COLS = {
@@ -2222,22 +2362,34 @@ def main() -> None:
         return
 
     try:
-        parts = df_to_parts(parts_df)
+        parts = df_to_parts(parts_df, require_qty=not densest_mode)
         formats = df_to_formats(formats_df)
     except Exception as exc:
         st.error(f"{exc}")
         return
 
-    total_pcs = sum(p.qty for p in parts)
     safe_fmt_names = ', '.join(html_mod.escape(f.name) for f in formats)
-    st.markdown(
-        f"<div class='qpv-info-bar'>"
-        f"Načteno <b>{len(parts)} typů dílců</b> = <b>{total_pcs:,} ks celkem</b>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-        f"<b>{len(formats)} formátů archů</b>: {safe_fmt_names}"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    if densest_mode:
+        st.markdown(
+            f"<div class='qpv-info-bar'>"
+            f"Režim <b>Nejhustší rozkres na arch</b>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<b>{len(parts)} typů dílců</b>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<b>{len(formats)} archů</b>: {safe_fmt_names}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        total_pcs = sum(p.qty for p in parts)
+        st.markdown(
+            f"<div class='qpv-info-bar'>"
+            f"Načteno <b>{len(parts)} typů dílců</b> = <b>{total_pcs:,} ks celkem</b>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<b>{len(formats)} formátů archů</b>: {safe_fmt_names}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     # ---- check for oversized parts ----
     for p in parts:
@@ -2256,6 +2408,76 @@ def main() -> None:
                 f"na žádný dostupný arch! Optimalizace tento dílec přeskočí.",
                 icon="⚠️",
             )
+
+    # ============= DENSEST-LAYOUT MODE: separate run + results =============
+    if densest_mode:
+        if do_run:
+            with st.status("Hledám nejhustší rozkres pro každý arch …", expanded=True) as status:
+                try:
+                    st.session_state.densest_q = densest_per_sheet(
+                        parts, formats, margin, gap, force_no_rotate, float(budget_s),
+                    )
+                    status.update(label="Hotovo!", state="complete")
+                except Exception as exc:
+                    status.update(label="Chyba při výpočtu", state="error")
+                    st.error(f"{exc}")
+
+        dres = st.session_state.get("densest_q")
+        if dres is None:
+            return
+
+        st.markdown("---")
+        st.markdown(
+            "<h2 style='color:#0e3572; font-weight:700; border-bottom:3px solid #0e3572; "
+            "padding-bottom:6px;'>Nejhustší rozkres na arch</h2>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Pro každý arch zvlášť je zobrazen nejhustší možný rozkres "
+            "(nejvíc kusů na jeden arch). Počty kusů a kombinace archů se neřeší."
+        )
+        for fmt, pat in dres:
+            title = f"{fmt.name} ({_fmt_mm(fmt.width_cm)} × {_fmt_mm(fmt.height_cm)} mm)"
+            if pat is None:
+                st.warning(f"**{html_mod.escape(fmt.name)}** — žádný dílec se na tento arch nevejde.", icon="⚠️")
+                continue
+            contents = ", ".join(f"{v}× {k}" for k, v in sorted(pat.part_counts.items()))
+            with st.expander(
+                f"{title}  —  {pat.total_items} ks na arch  —  výtěžnost {pat.utilization * 100:.1f} %",
+                expanded=True,
+            ):
+                mc1, mc2 = st.columns(2)
+                mc1.metric("Kusů na arch", f"{pat.total_items}")
+                mc2.metric("Výtěžnost", f"{pat.utilization * 100:.1f} %")
+                st.caption(f"Obsah: {contents}")
+                fig = draw_sheet_figure(pat.placements, fmt, 1, fmt.name, margin)
+                st.pyplot(fig, clear_figure=False)
+                plt.close(fig)
+
+        # ---- PDF export (same two modes as the main result view) ----
+        if any(pat is not None for _, pat in dres):
+            pdf_res = densest_to_result(dres, margin)
+            st.markdown("##### Export do PDF")
+            col_screen, col_print = st.columns(2)
+            with col_screen:
+                st.download_button(
+                    "📱 PDF pro obrazovku (PC / mobil)",
+                    data=_build_pdf_cached(_pdf_cache_key(pdf_res, margin, logo_bytes is not None), "screen", pdf_res, margin, logo_bytes),
+                    file_name="qpv-rozkres-obrazovka.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+                st.caption("Jedna dlouhá stránka na arch, velká čitelná čísla — scrolluješ dolů.")
+            with col_print:
+                st.download_button(
+                    "🖨️ PDF pro tisk (A4)",
+                    data=_build_pdf_cached(_pdf_cache_key(pdf_res, margin, logo_bytes is not None), "print", pdf_res, margin, logo_bytes),
+                    file_name="qpv-rozkres-tisk.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+                st.caption("Arch rozdělený na navazující A4 stránky — čitelné i vytištěné.")
+        return
 
     if do_run:
         status = st.status(f"Hledám nejlepší rozložení (max. {budget_s} s) …", expanded=True)
@@ -2398,7 +2620,7 @@ def main() -> None:
     with col_screen:
         st.download_button(
             "📱 PDF pro obrazovku (PC / mobil)",
-            data=build_pdf(res, margin, logo_bytes, mode="screen"),
+            data=_build_pdf_cached(_pdf_cache_key(res, margin, logo_bytes is not None), "screen", res, margin, logo_bytes),
             file_name="qpv-narezovy-plan-obrazovka.pdf",
             mime="application/pdf",
             use_container_width=True,
@@ -2407,7 +2629,7 @@ def main() -> None:
     with col_print:
         st.download_button(
             "🖨️ PDF pro tisk (A4)",
-            data=build_pdf(res, margin, logo_bytes, mode="print"),
+            data=_build_pdf_cached(_pdf_cache_key(res, margin, logo_bytes is not None), "print", res, margin, logo_bytes),
             file_name="qpv-narezovy-plan-tisk.pdf",
             mime="application/pdf",
             use_container_width=True,
